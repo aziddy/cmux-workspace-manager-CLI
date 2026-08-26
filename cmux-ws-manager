@@ -1,0 +1,885 @@
+#!/usr/bin/env python3
+# cmux-ws-manager — list cmux workspaces you've closed, and reopen them.
+# Copyright (C) 2026 aziddy
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+# License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""List cmux workspaces that were closed, and optionally reopen one.
+
+Primary source: cmux's own closed-item history
+(~/Library/Application Support/cmux/closed-item-history-*.json), which the
+app maintains for every closed workspace and panel. It stores cwd, layout,
+git branch, and the workspace's custom title; its retention is bounded.
+
+Supplement: workspace-category events harvested from the rotating
+~/.cmuxterm/events.jsonl logs into ~/.cmuxterm/workspace-history.jsonl on
+every run. These supply titles for records that predate customTitle, closes
+older than the native retention, and workspace.created events used to drop
+reopened workspaces.
+
+With no command this runs an interactive curses browser; it falls back to
+the plain listing whenever a terminal is not available or --no-interactive
+is given, so scripts and agents always get parseable text.
+"""
+import json, locale, os, shlex, subprocess, sys, unicodedata
+from datetime import datetime
+try:
+    import curses  # importing is side-effect free; nothing touches the tty
+except ImportError:  # until initscr, so --help stays unaffected
+    curses = None
+
+LOG_DIR = os.path.expanduser("~/.cmuxterm")
+ROTATING = [os.path.join(LOG_DIR, "events.jsonl.1"), os.path.join(LOG_DIR, "events.jsonl")]
+HISTORY = os.path.join(LOG_DIR, "workspace-history.jsonl")
+NATIVE = os.path.expanduser(
+    "~/Library/Application Support/cmux/closed-item-history-com.cmuxterm.app.json")
+APPLE_EPOCH = 978307200  # 2001-01-01 UTC, the reference for closedAt
+AGENT_RESUME = {"claude": "claude --resume {}", "codex": "codex resume {}"}
+GRAFT_WINDOW = 7 * 86400  # how far back a carried-over session may come from;
+                          # native history holds about a week either way
+
+HELP = """usage: {prog} [--all] [--no-interactive]
+       {prog} reopen <n> [--plain]
+
+List cmux workspaces you've closed, and reopen them.
+
+With no command this opens an interactive browser: up/down (or k/j) to move,
+enter to reopen, p to reopen empty, / to filter, ? for all keys, q or esc to
+quit. It prints the plain listing instead when output is not a terminal, when
+TERM is unset or "dumb", or with --no-interactive.
+
+Commands:
+  reopen <n>        Rebuild workspace <n> from cmux's snapshot: split layout,
+                    terminal directories, AI panes resumed, browser tabs.
+
+Options:
+  --all             Show the raw close history instead of the default
+                    one-row-per-directory view.
+  --no-interactive  Skip the browser and print the plain listing.
+  --plain           With reopen: skip layout restore and open an empty
+                    workspace at the original directory.
+  -h, --help        Show this message and exit.
+
+reopen <n> numbering always follows the default view, so --all output is
+for inspection only.
+"""
+
+def parse_workspace_event(line):
+    if '"category":"workspace"' not in line:
+        return None
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if ev.get("category") == "workspace" and ev.get("id") and ev.get("workspace_id"):
+        return ev
+    return None
+
+def load_events():
+    events = {}
+    if os.path.exists(HISTORY):
+        with open(HISTORY, errors="replace") as f:
+            for line in f:
+                ev = parse_workspace_event(line)
+                if ev:
+                    events[ev["id"]] = ev
+    fresh = []
+    for path in ROTATING:
+        if not os.path.exists(path):
+            continue
+        with open(path, errors="replace") as f:
+            for line in f:
+                ev = parse_workspace_event(line)
+                if ev and ev["id"] not in events:
+                    events[ev["id"]] = ev
+                    fresh.append(line.rstrip("\n"))
+    if fresh:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(HISTORY, "a") as f:
+            f.write("\n".join(fresh) + "\n")
+    return events
+
+def iso_to_unix(ts):
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return 0
+
+def native_closed():
+    try:
+        with open(NATIVE) as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    out = []
+    for r in d.get("records", []):
+        w = r.get("entry", {}).get("workspace")
+        if not w:
+            continue
+        inner = w.get("_0", w)
+        snap = inner.get("snapshot", {})
+        out.append({"ts": (r.get("closedAt") or 0) + APPLE_EPOCH,
+                    "id": inner.get("workspaceId") or snap.get("workspaceId") or "",
+                    "cwd": snap.get("currentDirectory") or "",
+                    "branch": (snap.get("gitBranch") or {}).get("branch") or "",
+                    "title": "", "custom": snap.get("customTitle") or "",
+                    "snapshot": snap})
+    return out
+
+def resume_command_for(term):
+    """Shell text that brings one pane's agent session back, or None.
+
+    `cmux restore <kind> <checkpoint-id>` relaunches cmux's own persisted
+    surface process, so the pane stays bound to the agent session and the
+    next close still records it — typing the provider's resume flag into a
+    plain shell does not, which silently drops the session one close later.
+    That flag remains the fallback for snapshots taken before resumeBinding
+    existed and for checkpoints cmux can no longer resolve.
+    """
+    term = term or {}
+    binding, agent = term.get("resumeBinding") or {}, term.get("agent") or {}
+    cmds = []
+    kind, checkpoint = binding.get("kind"), binding.get("checkpointId")
+    if kind in AGENT_RESUME and checkpoint:
+        cmds.append(f"cmux restore {shlex.quote(kind)} {shlex.quote(checkpoint)}")
+    kind, sid = agent.get("kind"), agent.get("sessionId")
+    if kind in AGENT_RESUME and sid:
+        cmds.append(AGENT_RESUME[kind].format(shlex.quote(sid)))
+    if not cmds:
+        return None
+    # `cmux restore` replaces the process that calls it, so a chain starting
+    # with one runs in a subshell: the pane's own shell outlives the agent and
+    # is still there once it exits.
+    chain = " || ".join(cmds)
+    return f"({chain})" if cmds[0].startswith("cmux restore") else chain
+
+def surface_for(panel, default_cwd):
+    if not panel:
+        return {"type": "terminal"}
+    browser = panel.get("browser")
+    if browser is not None:
+        s = {"type": "browser"}
+        if browser.get("urlString"):
+            s["url"] = browser["urlString"]
+        return s
+    term = panel.get("terminal") or {}
+    cwd = term.get("workingDirectory") or panel.get("directory") or default_cwd
+    parts = []
+    if cwd:
+        parts.append(f"cd {shlex.quote(cwd)}")
+    resume = resume_command_for(term)
+    if resume:
+        parts.append(resume)
+    s = {"type": "terminal"}
+    if parts:
+        s["command"] = " && ".join(parts)
+    return s
+
+def build_layout(snapshot):
+    """Convert a closed-workspace snapshot into new-workspace --layout JSON.
+
+    Snapshot layout is a binary tree of split/pane nodes; the --layout schema
+    wants direction/split/children with per-pane surface lists. Layout surface
+    commands are typed into the pane's live shell, so `cd <dir> && <resume>`
+    leaves a normal shell behind if (or after) the command exits.
+    """
+    if not snapshot or not snapshot.get("layout"):
+        return None
+    panels = {p.get("id"): p for p in snapshot.get("panels", [])}
+    default_cwd = snapshot.get("currentDirectory") or ""
+
+    def convert(node):
+        if node.get("type") == "split":
+            sp = node.get("split", {})
+            return {"direction": sp.get("orientation", "horizontal"),
+                    "split": sp.get("dividerPosition", 0.5),
+                    "children": [convert(sp.get("first", {})),
+                                 convert(sp.get("second", {}))]}
+        pane = node.get("pane", {})
+        surfaces = [surface_for(panels.get(pid), default_cwd)
+                    for pid in pane.get("panelIds", [])]
+        return {"pane": {"surfaces": surfaces or [{"type": "terminal"}]}}
+
+    try:
+        return convert(snapshot["layout"])
+    except Exception:
+        return None
+
+def agent_panels(snapshot):
+    """Indexes of the panels in a snapshot that carry a resumable session."""
+    return [i for i, p in enumerate((snapshot or {}).get("panels") or [])
+            if p.get("browser") is None and resume_command_for(p.get("terminal"))]
+
+def match_panel(donor, idx, panels, taken):
+    """Pick the pane in `panels` that corresponds to a donor's agent pane.
+
+    Nothing identifying survives a reopen — panel ids and stableSurfaceIds are
+    regenerated — so the match is the pane title plus its working directory,
+    then the same position, and only ever a pane with no session of its own.
+    """
+    wd = (donor.get("terminal") or {}).get("workingDirectory") or None
+    title = donor.get("title")
+
+    def free(j):
+        p = panels[j]
+        return (j not in taken and p.get("browser") is None
+                and not resume_command_for(p.get("terminal"))
+                and wd == ((p.get("terminal") or {}).get("workingDirectory") or None))
+
+    if title:
+        for j, p in enumerate(panels):
+            if p.get("title") == title and free(j):
+                return j
+    if 0 <= idx < len(panels) and free(idx):
+        return idx
+    return None
+
+def graft_agents(item, donors):
+    """Carry an older close's agent bindings onto a newer agent-less snapshot.
+
+    A pane reopened by this tool is a plain terminal as far as cmux is
+    concerned, so closing a restored workspace writes a snapshot with no
+    binding at all — and that newer record is the one the default view keeps,
+    which is how a resumable session becomes unreachable. Donors are earlier
+    closes of the same workspace (see `identity`), newest first, so a session
+    is never carried over from a different workspace that happens to share the
+    directory; the item is left untouched when it has a session of its own or
+    nothing matches.
+    """
+    snap = item.get("snapshot")
+    if not snap or not snap.get("panels") or agent_panels(snap):
+        return item
+    for donor in donors:
+        if not (0 < item["ts"] - donor["ts"] <= GRAFT_WINDOW):
+            continue
+        dsnap = donor.get("snapshot") or {}
+        sources = agent_panels(dsnap)
+        if not sources:
+            continue
+        panels, taken, moved = [dict(p) for p in snap["panels"]], set(), 0
+        for i in sources:
+            dp = dsnap["panels"][i]
+            j = match_panel(dp, i, panels, taken)
+            if j is None:
+                continue
+            term = dict(panels[j].get("terminal") or {})
+            for key in ("agent", "resumeBinding"):
+                if (dp.get("terminal") or {}).get(key):
+                    term[key] = dp["terminal"][key]
+            panels[j]["terminal"] = term
+            taken.add(j)
+            moved += 1
+        if moved:
+            item = dict(item, snapshot=dict(snap, panels=panels), grafted=True)
+        break  # only the most recent close that had a session gets a say
+    return item
+
+def restore_counts(snapshot):
+    terms = agents = browsers = 0
+    for p in snapshot.get("panels", []):
+        if p.get("browser") is not None:
+            browsers += 1
+        elif resume_command_for(p.get("terminal")):
+            agents += 1
+        else:
+            terms += 1
+    return terms, agents, browsers
+
+def norm_path(p):
+    return os.path.normpath(os.path.expanduser(p)) if p else ""
+
+def open_workspaces():
+    """Return (ids, cwds, titles) for every open workspace across all windows.
+
+    A reopened directory gets a new workspace UUID, so the id check alone is
+    not enough and the directory has to be matched too. `titles` maps a
+    directory to the names of the workspaces sitting on it, which is what
+    keeps that directory match from swallowing a second, differently named
+    workspace on the same path.
+    """
+    env = {**os.environ, "CMUX_QUIET": "1"}
+    ids, cwds, titles = set(), set(), {}
+    try:
+        out = subprocess.run(["cmux", "list-windows"], capture_output=True,
+                             text=True, timeout=5, env=env).stdout
+        windows = [tok for line in out.splitlines() for tok in line.split()
+                   if len(tok) == 36 and tok.count("-") == 4]
+        for win in windows:
+            raw = subprocess.run(
+                ["cmux", "workspace", "list", "--json", "--window", win],
+                capture_output=True, text=True, timeout=5, env=env).stdout
+            for ws in json.loads(raw).get("workspaces", []):
+                if ws.get("id"):
+                    ids.add(ws["id"])
+                if ws.get("current_directory"):
+                    d = norm_path(ws["current_directory"])
+                    cwds.add(d)
+                    for key in ("custom_title", "title"):
+                        if ws.get(key):
+                            titles.setdefault(d, set()).add(ws[key].strip().casefold())
+        if windows:
+            return ids, cwds, titles
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(["cmux", "list-workspaces", "--id-format", "uuids"],
+                             capture_output=True, text=True, timeout=5, env=env).stdout
+        ids |= {tok for line in out.splitlines() for tok in line.split() if len(tok) == 36}
+    except Exception:
+        pass
+    return ids, cwds, titles  # this fallback knows no directories or titles
+
+def identity(it):
+    """What makes one closed workspace distinct from another.
+
+    cmux hands a reopened workspace a fresh UUID, so an id cannot tell two
+    closes of one workspace apart from two workspaces on one directory. A
+    title the user set can, and it survives the reopen. The directory
+    basename cannot — every close on a directory shares it — so an entry
+    with no custom title falls back to the directory alone, as before.
+    """
+    return (norm_path(it["cwd"]) or it["id"],
+            (it.get("custom") or "").strip().casefold())
+
+def dir_occupied(it, open_cwds, open_titles):
+    """True when an open workspace already stands in for this closed one.
+
+    Only a workspace on the same directory carrying the same name counts.
+    Two workspaces kept on one repo — say a "Group 1" and a "CMUX Stuff" —
+    are different workspaces, and closing one of them must not be hidden by
+    the other still being open.
+    """
+    d = norm_path(it["cwd"])
+    if d not in open_cwds:
+        return False
+    custom = (it.get("custom") or "").strip().casefold()
+    return not custom or custom in open_titles.get(d, set())
+
+def entries(show_all=False):
+    titles, ev_closed, created_at = {}, {}, {}
+    ordered = sorted(load_events().values(),
+                     key=lambda e: (e.get("occurred_at") or "", e.get("seq") or 0))
+    for ev in ordered:
+        wsid, p = ev["workspace_id"], ev.get("payload", {})
+        title = p.get("custom_title") or p.get("title") or p.get("new_title")
+        if title:
+            titles[wsid] = title
+        ts = iso_to_unix(ev.get("occurred_at"))
+        if ev["name"] == "workspace.closed":
+            ev_closed[wsid] = {"ts": ts, "id": wsid, "cwd": p.get("cwd") or "",
+                               "branch": "", "title": title or "",
+                               "custom": p.get("custom_title") or ""}
+        elif ev["name"] == "workspace.created":
+            ev_closed.pop(wsid, None)  # reopened (e.g. session restore)
+            created_at[wsid] = max(created_at.get(wsid, 0), ts)
+    native = native_closed()
+    native_ids = {n["id"] for n in native}
+    items = [n for n in native if created_at.get(n["id"], 0) <= n["ts"]]
+    items += [e for e in ev_closed.values() if e["id"] not in native_ids]
+    open_ids, open_cwds, open_titles = open_workspaces()
+    items = [it for it in items if it["id"] not in open_ids]
+    if not show_all:
+        items = [it for it in items
+                 if not dir_occupied(it, open_cwds, open_titles)]
+    for it in items:
+        if not it["title"]:
+            it["title"] = it.get("custom") or titles.get(it["id"]) or \
+                os.path.basename(it["cwd"].rstrip("/")) or "(untitled)"
+    donors = {}
+    if not show_all:  # --all is raw close history; grafting there would lie
+        for n in sorted(native, key=lambda x: x["ts"], reverse=True):
+            donors.setdefault(identity(n), []).append(n)
+    seen, out = set(), []
+    for it in sorted(items, key=lambda x: x["ts"], reverse=True):
+        key = (it["id"], int(it["ts"]) // 120) if show_all else identity(it)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not show_all:
+            # donors share the key, so a session is only ever carried between
+            # closes of the same workspace, never from its neighbour on the
+            # same directory
+            it = graft_agents(it, donors.get(key, []))
+            it["dir_open"] = norm_path(it["cwd"]) in open_cwds
+        out.append(it)
+    return out
+
+def when_of(it):
+    return datetime.fromtimestamp(it["ts"]).strftime("%b %d %H:%M") if it["ts"] else "?"
+
+def short_cwd(it, home):
+    return it["cwd"].replace(home, "~", 1)
+
+def print_list(items, show_all, prog):
+    if not items:
+        print("No closed workspaces found.")
+        return
+    home = os.path.expanduser("~")
+    for i, it in enumerate(items, 1):
+        branch = f"  [{sanitize(it['branch'])}]" if it["branch"] else ""
+        taken = "  (dir open)" if it.get("dir_open") else ""
+        print(f"{i:>3}  {when_of(it):<13} {sanitize(it['title']):<28} "
+              f"{sanitize(short_cwd(it, home))}{branch}{taken}")
+    if show_all:
+        print("\n(--all view; reopen numbering follows the default filtered list)")
+    else:
+        print(f"\nReopen one with: {prog} reopen <n>")
+
+def do_reopen(it, plain=False):
+    """Rebuild one closed workspace through cmux. Returns cmux's exit code.
+
+    stdio is inherited (not captured) so cmux's own output and Ctrl-C keep
+    working; the browser therefore tears curses down before calling this.
+    """
+    cmd = ["cmux", "new-workspace", "--name", it["title"]]
+    if it["cwd"]:
+        cmd += ["--cwd", it["cwd"]]
+    layout = None if plain else build_layout(it.get("snapshot"))
+    if layout:
+        cmd += ["--layout", json.dumps(layout)]
+    rc = subprocess.run(cmd).returncode
+    if rc == 0 and layout:
+        t, a, b = restore_counts(it["snapshot"])
+        print(f"Restored {t} terminal(s), {a} AI session(s) resuming, {b} browser tab(s).")
+        if a and it.get("grafted"):
+            print("Its AI session came from an earlier close of this directory.")
+    elif rc == 0 and not plain:
+        print("No snapshot for this entry; opened an empty workspace at its directory.")
+    return rc
+
+# --- interactive browser -------------------------------------------------
+#
+# One curses screen, one item list, two lines per row. The browser only ever
+# picks an entry; main() tears curses down and calls do_reopen, so cmux never
+# writes over the screen and the printed summary is identical either way.
+
+MARK_W, NUM_W, WHEN_W = 2, 5, 15  # column widths shared by both row lines
+
+def tui_available():
+    """True when a curses UI can safely own this terminal."""
+    if curses is None or os.environ.get("TERM", "") in ("", "dumb"):
+        return False
+    try:  # stdout carries the drawing, stdin the keys; a pipe on either loses
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (ValueError, AttributeError):
+        return False
+
+def sanitize(s, ascii_only=False):
+    """Strip anything that would move the cursor or reorder a line.
+
+    Titles and paths come from history files we treat as untrusted, so tabs,
+    newlines, escapes, and bidi overrides all collapse to spaces. On an ASCII
+    terminal the rest is transliterated here, because ncurses would otherwise
+    silently blank the glyphs it cannot encode and leave the row unreadable.
+    """
+    s = "".join(c if c.isprintable() else " " for c in (s or ""))
+    return s.encode("ascii", "replace").decode() if ascii_only else s
+
+def cwidth(c):
+    if unicodedata.combining(c):
+        return 0
+    return 2 if unicodedata.east_asian_width(c) in "WF" else 1
+
+def dwidth(s):
+    return sum(cwidth(c) for c in s)
+
+def fit(s, n, ell="…"):
+    """Truncate to n display columns, marking the cut."""
+    if n <= 0:
+        return ""
+    if dwidth(s) <= n:
+        return s
+    out, w, lim = [], 0, n - dwidth(ell)
+    for c in s:
+        if w + cwidth(c) > lim:
+            break
+        out.append(c)
+        w += cwidth(c)
+    return "".join(out) + ell
+
+def pad(s, n):
+    return s + " " * max(0, n - dwidth(s))
+
+def put(win, y, x, s, n, attr=0):
+    """addnstr that never raises: the bottom-right cell always errors."""
+    if n <= 0 or y < 0 or x < 0 or not s:
+        return
+    try:
+        win.addnstr(y, x, s, n, attr)
+    except UnicodeEncodeError:  # one stray glyph must not blank the whole row
+        try:
+            win.addnstr(y, x, s.encode("ascii", "replace").decode(), n, attr)
+        except (curses.error, UnicodeEncodeError):
+            pass
+    except curses.error:
+        pass
+
+def tui_colors():
+    """Named attributes, degrading to bold/dim/reverse without color.
+
+    The selection is reverse video in every mode: it inherits the user's
+    theme, reads on light and dark backgrounds, and needs no NO_COLOR case.
+    """
+    names = ("hdr", "num", "time", "title", "path", "meta", "badge", "bar", "warn")
+    a = dict.fromkeys(names, 0)
+    a["sel"] = curses.A_REVERSE | curses.A_BOLD
+    if os.environ.get("NO_COLOR", "") or not curses.has_colors():
+        a.update(hdr=curses.A_BOLD, num=curses.A_BOLD, title=curses.A_BOLD,
+                 time=curses.A_DIM, meta=curses.A_DIM, badge=curses.A_DIM,
+                 bar=curses.A_REVERSE, warn=curses.A_BOLD)
+        return a
+    try:
+        curses.start_color()
+    except curses.error:
+        return a
+    try:
+        curses.use_default_colors()  # keep the terminal's own background
+        bg = -1
+    except curses.error:
+        bg = curses.COLOR_BLACK
+
+    def pair(n, fg, back=bg, fallback=0):
+        try:
+            curses.init_pair(n, fg, back)
+            return curses.color_pair(n)
+        except (curses.error, ValueError):
+            return fallback
+
+    a["hdr"] = pair(1, curses.COLOR_CYAN, fallback=curses.A_BOLD) | curses.A_BOLD
+    a["num"] = pair(2, curses.COLOR_YELLOW, fallback=curses.A_BOLD)
+    a["time"] = pair(3, curses.COLOR_BLUE, fallback=curses.A_DIM)
+    a["title"] = curses.A_BOLD
+    a["meta"] = pair(4, curses.COLOR_GREEN, fallback=curses.A_DIM)
+    a["badge"] = pair(5, curses.COLOR_MAGENTA, fallback=curses.A_DIM)
+    a["warn"] = pair(6, curses.COLOR_RED, fallback=curses.A_BOLD) | curses.A_BOLD
+    a["bar"] = pair(7, curses.COLOR_BLACK, curses.COLOR_CYAN,
+                    fallback=curses.A_REVERSE)
+    return a
+
+def badges(it):
+    """What a reopen would restore — counts only, never session identifiers."""
+    snap = it.get("snapshot")
+    if not snap:
+        parts = ["no snapshot"]
+    else:
+        t, a, b = restore_counts(snap)
+        ai = "AI*" if it.get("grafted") else "AI"  # * = carried over, ? help
+        parts = [f"{n}{s}" for n, s in ((t, "T"), (a, ai), (b, "web")) if n]
+        parts = parts or ["empty"]
+    if it.get("dir_open"):
+        parts.append("dir open")
+    return "  ".join(parts)
+
+def visible(st):
+    """The current item list after the incremental filter."""
+    items = st["items"] or []
+    q = st["q"].casefold()
+    if not q:
+        return items
+    return [it for it in items
+            if q in (it["title"] or "").casefold() or q in (it["cwd"] or "").casefold()]
+
+def clamp_view(sel, off, rows, n, margin=1):
+    """Clamp the selection into the list and slide the viewport onto it.
+
+    Every frame runs this, so handlers only ever nudge sel; resize, filtering,
+    and a shrinking list can never strand the cursor off screen.
+    """
+    if n <= 0:
+        return 0, 0
+    sel = max(0, min(sel, n - 1))
+    m = margin if rows > 2 * margin + 1 else 0
+    if sel < off + m:
+        off = sel - m
+    elif sel >= off + rows - m:
+        off = sel - rows + 1 + m
+    return sel, max(0, min(off, max(0, n - rows)))
+
+def draw_row(stdscr, st, y, num, it, selected, w):
+    """Two lines: identity on the first, git branch and restore counts below."""
+    a, ell, asc = st["attr"], st["ell"], st["ascii"]
+    tw = min(28, max(8, (w - MARK_W - NUM_W - WHEN_W - 2) // 2))  # title and
+    cwd_x = MARK_W + NUM_W + WHEN_W + tw + 2              # path split what is left
+    rest = max(0, w - cwd_x)
+    mark = (st["mark"] + " ") if selected else "  "
+    label = f"  {st['dot']}  " if st["show_all"] else f"{num:>3}  "
+    when = pad(when_of(it), WHEN_W)
+    title = fit(sanitize(it["title"], asc), tw, ell)
+    cwd = fit(sanitize(short_cwd(it, st["home"]), asc), rest, ell)
+    meta = fit("  ".join(x for x in (sanitize(it["branch"], asc), badges(it)) if x),
+               rest, ell)
+    if selected:  # one attribute for the whole bar; mixing a color pair with
+        put(stdscr, y, 0,     # A_REVERSE is unreadable on many terminals
+            pad(mark + label + when + pad(title, tw + 2) + cwd, w), w, a["sel"])
+        put(stdscr, y + 1, 0, pad(" " * cwd_x + meta, w), w, a["sel"])
+        return
+    put(stdscr, y, 0, mark + label, MARK_W + NUM_W, a["num"])
+    put(stdscr, y, MARK_W + NUM_W, when, WHEN_W, a["time"])
+    put(stdscr, y, MARK_W + NUM_W + WHEN_W, title, tw, a["title"])
+    put(stdscr, y, cwd_x, cwd, rest, a["path"])
+    put(stdscr, y + 1, cwd_x, meta, rest, a["badge"])
+
+def hint_bar(st, w):
+    frags = ([st["up"] + st["down"] + " move", st["enter"] + " reopen", "p plain",
+              "/ search", "r refresh", "? keys", "q / esc quit"])
+    while frags:
+        s = "  ".join(frags)
+        if dwidth(s) <= w - 2:
+            return " " + s
+        frags.pop()
+    return ""
+
+def tui_draw(stdscr, st):
+    h, w = stdscr.getmaxyx()
+    a = st["attr"]
+    stdscr.erase()
+    if h < 6 or w < 30:
+        put(stdscr, 0, 0, "window too small", w - 1, a["warn"])
+        stdscr.refresh()
+        return
+    vis = visible(st)
+    rows = max(1, (h - 4) // 2)
+    st["rows"] = rows
+    st["sel"], st["off"] = clamp_view(st["sel"], st["off"], rows, len(vis))
+    total = len(st["items"] or [])
+    head = "  Closed workspaces" + (f"  {st['dot']}  all history"
+                                     if st["show_all"] else "")
+    put(stdscr, 0, 0, fit(head, w - 1, st["ell"]), w - 1, a["hdr"])
+    count = f"{len(vis)} of {total}  " if len(vis) != total else f"{total}  "
+    if dwidth(head) + dwidth(count) + 2 < w:
+        put(stdscr, 0, w - 1 - dwidth(count), count, dwidth(count), a["time"])
+    stdscr.hline(1, 0, curses.ACS_HLINE, w)
+    if not vis:
+        msg = (f"No match for '{sanitize(st['q'], st['ascii'])}'"
+               + f" {st['dash']} esc to clear"
+               if st["q"] else "No closed workspaces found.")
+        put(stdscr, 2 + rows, max(0, (w - dwidth(msg)) // 2), msg, w - 1, a["warn"])
+    for i, it in enumerate(vis[st["off"]:st["off"] + rows], st["off"]):
+        draw_row(stdscr, st, 2 + (i - st["off"]) * 2, i + 1, it, i == st["sel"], w)
+    if st["mode"] == "search":
+        put(stdscr, h - 2, 0, fit("/" + sanitize(st["q"], st["ascii"]), w - 1,
+                                  st["ell"]), w - 1, a["hdr"])
+    elif st["status"]:
+        put(stdscr, h - 2, 1, fit(st["status"], w - 2, st["ell"]), w - 2, a["meta"])
+    elif st["q"]:
+        put(stdscr, h - 2, 1,
+            fit(f"filter: {sanitize(st['q'], st['ascii'])}   (esc to clear)",
+                w - 2, st["ell"]), w - 2, a["meta"])
+    elif st["show_all"]:  # the on-screen twin of the --all footer note
+        put(stdscr, h - 2, 1, fit(f"all history {st['dash']} reopen <n> numbering "
+                                  "follows the default view", w - 2, st["ell"]),
+            w - 2, a["meta"])
+    put(stdscr, h - 1, 0, pad(hint_bar(st, w), w), w, a["bar"])
+    if st["mode"] == "search":
+        try:
+            curses.curs_set(1)
+            stdscr.move(h - 2, min(w - 1, 1 + dwidth(st["q"])))
+        except curses.error:
+            pass
+    stdscr.refresh()
+
+def tui_load(stdscr, st):
+    """Fill the item list, showing a frame first because entries() is slow."""
+    st["items"], st["status"] = [], "Loading closed workspaces" + st["ell"]
+    tui_draw(stdscr, st)
+    try:
+        st["items"] = entries(st["show_all"])
+        st["status"] = ""
+    except Exception as e:  # history is untrusted; never die on one bad file
+        st["status"] = f"Could not read history ({e.__class__.__name__})."
+    curses.flushinp()  # entries() blocks for seconds; drop keys typed meanwhile
+                       # so an impatient enter cannot reopen a random workspace
+
+def read_key(win):
+    """int for special and control keys, str for typed text, None if interrupted.
+
+    get_wch, not getch: getch hands back raw UTF-8 bytes, which would corrupt
+    the search box the moment anyone types a non-ASCII character.
+    """
+    try:
+        k = win.get_wch()
+    except curses.error:
+        return None
+    if isinstance(k, int):
+        return k
+    return ord(k) if (k == "\x7f" or ord(k) < 32) else k
+
+def search_key(st, k):
+    if k == 27:                                    # esc: cancel and drop it
+        st["q"], st["mode"] = "", "list"
+    elif k in (10, 13, curses.KEY_ENTER):          # accept, keep it as a filter
+        st["mode"] = "list"
+    elif k in (curses.KEY_BACKSPACE, 127, 8):      # all three genuinely occur
+        st["q"] = st["q"][:-1]
+    elif k == 21:                                  # ^U
+        st["q"] = ""
+    elif isinstance(k, str):
+        st["q"] += k
+    st["sel"] = 0
+    return False
+
+def help_overlay(stdscr, st):
+    lines = ["up / k        move up", "down / j      move down",
+             "pgup pgdn     page", "home g / end G  first / last",
+             "enter         reopen with its saved layout",
+             "p             reopen empty at the same directory",
+             "/             filter by title or path",
+             "esc           clear the filter, quit when none",
+             "r             reload",
+             "?             this help", "q             quit", "",
+             "AI* marks a session carried over from an",
+             "earlier close of the same workspace.",
+             "dir open means another workspace is already",
+             "on that directory; reopening adds a second."]
+    h, w = stdscr.getmaxyx()
+    bh, bw = min(len(lines) + 4, h), min(max(len(s) for s in lines) + 6, w)
+    win = curses.newwin(bh, bw, max(0, (h - bh) // 2), max(0, (w - bw) // 2))
+    win.bkgd(" ", st["attr"]["hdr"])
+    win.box()
+    put(win, 1, 3, "Keys", bw - 4, st["attr"]["hdr"])
+    for i, s in enumerate(lines[:bh - 4]):
+        put(win, i + 2, 3, s, bw - 4)
+    win.refresh()
+    read_key(win)
+    del win
+    stdscr.touchwin()  # without this the covered cells are never repainted
+
+def tui_key(stdscr, st, k):
+    """Handle one key. Returns True to leave the loop."""
+    if st["mode"] == "search":
+        return search_key(st, k)
+    vis, rows = visible(st), st["rows"]
+    if k in (curses.KEY_UP, "k", 16):
+        st["sel"] -= 1
+    elif k in (curses.KEY_DOWN, "j", 14):
+        st["sel"] += 1
+    elif k in (curses.KEY_PPAGE, 2):
+        st["sel"] -= rows
+    elif k in (curses.KEY_NPAGE, 6, " "):
+        st["sel"] += rows
+    elif k in (curses.KEY_HOME, "g"):
+        st["sel"] = 0
+    elif k in (curses.KEY_END, "G"):
+        st["sel"] = len(vis) - 1
+    elif k == "/":
+        st["mode"], st["status"] = "search", ""
+    elif k == 27:                       # esc backs out: filter first, then app
+        if not st["q"]:
+            return True
+        st["q"] = ""
+    elif k == "r":
+        tui_load(stdscr, st)
+    elif k == "?":
+        help_overlay(stdscr, st)
+    elif k in (10, 13, curses.KEY_ENTER, "p"):
+        if vis:
+            st["pick"] = (vis[st["sel"]], k == "p")
+            return True
+    elif k in ("q", 3):
+        return True
+    elif k == curses.KEY_RESIZE:
+        stdscr.erase()                  # geometry is re-read every frame
+    return False
+
+def tui_main(stdscr, st):
+    st["started"] = True
+    try:
+        curses.set_escdelay(25)  # 3.9+; the ESCDELAY env var covers the rest
+    except AttributeError:
+        pass
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    stdscr.keypad(True)
+    st["attr"] = tui_colors()
+    try:
+        tui_load(stdscr, st)
+        while True:
+            tui_draw(stdscr, st)
+            k = read_key(stdscr)
+            if k is not None and tui_key(stdscr, st, k):
+                return
+            if st["mode"] != "search":
+                try:
+                    curses.curs_set(0)
+                except curses.error:
+                    pass
+    finally:
+        try:
+            curses.curs_set(1)  # endwin does not restore this everywhere
+        except curses.error:
+            pass
+
+def run_tui(show_all):
+    """Run the browser and return its state, or None if curses never started."""
+    os.environ.setdefault("ESCDELAY", "25")  # ncurses reads this at initscr
+    try:  # LC_CTYPE only: LC_ALL would also set LC_TIME and localize the
+        locale.setlocale(locale.LC_CTYPE, "")  # dates in the plain listing
+    except locale.Error:
+        pass
+    try:  # the codeset ncurses will encode with; getpreferredencoding reports
+        "…▸↑↓⏎".encode(locale.nl_langinfo(locale.CODESET))  # UTF-8 regardless
+        uni = True
+    except (UnicodeEncodeError, LookupError, AttributeError, ValueError):
+        uni = False
+    st = {"items": None, "sel": 0, "off": 0, "rows": 1, "q": "", "mode": "list",
+          "status": "", "show_all": show_all, "attr": {}, "pick": None,
+          "started": False, "home": os.path.expanduser("~"),
+          "ascii": not uni, "ell": "…" if uni else "...",
+          "dot": "·" if uni else "-", "dash": "—" if uni else "-",
+          "mark": "▸" if uni else ">",
+          "up": "↑" if uni else "^", "down": "↓" if uni else "v",
+          "enter": "⏎" if uni else "enter"}
+    try:
+        curses.wrapper(tui_main, st)  # restores the terminal on any exception
+    except (curses.error, OSError, ValueError) as e:
+        if not st["started"]:
+            return None  # never drew anything: the caller prints the plain list
+        sys.stderr.write(f"{os.path.basename(sys.argv[0])}: display error "
+                         f"({e.__class__.__name__})\n")
+    except KeyboardInterrupt:
+        st["pick"] = None
+    return st
+
+def main():
+    prog = os.path.basename(sys.argv[0])
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        print(HELP.format(prog=prog), end="")  # short-circuits before any
+        return                                 # history read or cmux call
+    show_all = "--all" in argv
+    plain = "--plain" in argv
+    no_tui = "--no-interactive" in argv
+    args = [a for a in argv if a not in ("--all", "--plain", "--no-interactive")]
+    bad = [a for a in args if a.startswith("-")]
+    if bad:
+        sys.exit(f"{prog}: unrecognized option: {bad[0]}\n"
+                 f"Try '{prog} --help' for more information.")
+    if args and args[0] == "reopen":
+        items = entries()  # reopen indices always refer to the default filtered list
+        if len(args) < 2 or not args[1].isdigit() or not (1 <= int(args[1]) <= len(items)):
+            sys.exit(f"usage: {prog} reopen <n> [--plain]   (run with no args to see numbers)\n"
+                     f"Try '{prog} --help' for more information.")
+        sys.exit(do_reopen(items[int(args[1]) - 1], plain))
+    if not no_tui and tui_available():
+        st = run_tui(show_all)
+        if st is not None:  # curses ran, so the list was already loaded once
+            if st["pick"]:
+                it, pick_plain = st["pick"]
+                sys.exit(do_reopen(it, pick_plain))
+            return
+    print_list(entries(show_all), show_all, prog)
+
+if __name__ == "__main__":
+    main()
