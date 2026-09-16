@@ -2,9 +2,10 @@
 
 List [cmux](https://cmux.com) workspaces you've closed, and reopen them.
 
-cmux has no built-in command for this — `cmux list-workspaces` only shows open
-workspaces. But the app privately records every closed workspace, and this tool
-reads that record.
+cmux has a native History menu and `cmux restore-session` for its previous saved
+session, but `cmux list-workspaces` only shows open workspaces. This tool reads
+cmux's closed-item history to provide a searchable picker and numbered CLI
+reopen commands for individual closed workspaces.
 
 Run it with no arguments and you get an interactive picker:
 
@@ -17,7 +18,7 @@ Run it with no arguments and you get an interactive picker:
                                               1T
     3  Aug 19 01:24   code                    ~/code
                                               3T  1AI*
- ↑↓ move  ⏎ reopen  p plain  / search  r refresh  ? keys  q / esc quit
+ ↑↓ move  ⏎ reopen  / search  r refresh  ? keys  q / esc quit
 ```
 
 Arrow to a workspace, press enter, and it comes back. Each entry's second line
@@ -29,6 +30,9 @@ snapshot for say `no snapshot` — those can only be reopened empty.
 workspace — see [Sessions that outlive their snapshot](#sessions-that-outlive-their-snapshot).
 `dir open` means another workspace is already sitting on that directory, so
 reopening this one puts a second workspace there.
+`remote snapshot` means the workspace needs cmux's native History menu to
+restore its SSH/cloud connection. This tool refuses layout restoration for
+those entries; the command-line `reopen <n> --plain` opens only a local shell.
 
 ### Keys
 
@@ -37,7 +41,6 @@ reopening this one puts a second workspace there.
 | `↑` `↓` / `k` `j` | move |
 | `PgUp` `PgDn` / `Home` `End` / `g` `G` | page, first, last |
 | `enter` | reopen with the saved layout, then exit |
-| `p` | reopen empty at the same directory, then exit |
 | `/` | filter by title or path; `enter` keeps it, `esc` clears it |
 | `r` | reload |
 | `?` | key help |
@@ -65,8 +68,9 @@ start. Piping the bare command is therefore always safe: it never draws escape
 codes into the pipe and never waits for a keypress. Every entry is exactly one
 line, and `NO_COLOR` is honored in the picker.
 
-`reopen <n>` is the scriptable equivalent of pressing enter, and `reopen <n>
---plain` of pressing `p`.
+`reopen <n>` is the scriptable equivalent of pressing enter.
+The command-line option `reopen <n> --plain` opens an empty workspace at the
+saved directory and title, without restoring the layout or sessions.
 
 Run `cmux-ws-manager --help` for the full option list. An unrecognized option
 is a usage error, not a silent no-op.
@@ -95,22 +99,26 @@ adds a second workspace on that path.
 replaces the row numbers with `·`, because `reopen <n>` numbering always
 follows the default view.
 
-`reopen <n>` rebuilds the workspace from cmux's snapshot of it: the split
-layout and every tab come back — terminals at their original directories,
-AI panes resumed so the conversations pick up where they left off, and browser
-tabs at the page they were on. It works by converting the snapshot's layout
-tree into a `cmux new-workspace --layout` call whose surface commands are typed
-into each pane's shell (so a failed resume just leaves a shell at the right
-directory).
+`reopen <n>` rebuilds the workspace from cmux's snapshot: split layout,
+terminals starting at their original directories, custom pane names, supported
+AI sessions, and browser URLs. It converts the snapshot's layout tree into a
+`cmux new-workspace --layout` call. Workspaces captured when an entire window
+was closed are listed individually and reopen in the caller's window.
 
-An AI pane is relaunched with `cmux restore <kind> <checkpoint-id>`, cmux's own
-command for reviving a persisted surface process, falling back to
-`claude --resume <session>` / `codex resume <session>` for snapshots that
-predate cmux's `resumeBinding` or whose checkpoint it can no longer resolve.
-The native path matters beyond argv and environment fidelity: a pane that just
-has the provider's resume command typed into its shell is an ordinary terminal
-as far as cmux is concerned, so closing it writes a snapshot with no session in
-it at all.
+Supported AI providers are Claude Code, Codex, and OpenCode. With current cmux,
+each fresh terminal first registers a manual `cmux surface resume set` binding
+using the provider's standard resume command, then runs `cmux restore` for that
+surface and checkpoint. A checkpoint id alone cannot restore into a fresh pane:
+cmux resolves it against the calling surface's binding. Registering it also lets
+the next close retain the session identity.
+
+The binding uses `claude --resume <session>`, `codex resume <session>`, or
+`opencode --session <session>`. Original custom launch arguments, environment
+overrides, hook provenance, and approval settings are not copied from history.
+cmux versions without the surface-binding API use the provider command directly.
+When the binding API is available, a failed binding or restore leaves the shell
+available without a second launch attempt. Restore runs in a subshell, so the
+shell also survives when the agent exits.
 
 ### Sessions that outlive their snapshot
 
@@ -129,10 +137,14 @@ then by position, and only ever a pane that has no session of its own. A
 mismatch resumes the conversation one pane over, at the right directory.
 `--all` never grafts: it is the raw close history.
 
-Not restorable: scrollback, running non-agent processes, and browser
-back/forward history. Agent resume also requires cmux's checkpoint (or the
-provider's session files) to still exist. `reopen <n> --plain` skips all of this and opens an empty
-workspace at the original directory with the original title.
+Not restorable: scrollback, running non-agent processes, browser profiles and
+back/forward history, canvas positions, workspace groups, or SSH/cloud
+connections. Other panel types (including file previews and embedded agent chat)
+become terminal placeholders. Agent resume requires the provider and its session
+files to still exist. Missing or malformed layout snapshots reopen empty.
+`reopen <n> --plain` opens an empty local workspace at the saved directory with
+the original title. Creation has a 30-second timeout; if it times out, check
+whether the workspace appeared before retrying.
 
 ## How it works
 
@@ -140,11 +152,13 @@ Two sources, merged and deduplicated:
 
 1. **cmux's native closed-item history**
    (`~/Library/Application Support/cmux/closed-item-history-<bundle-id>.json`) —
-   the app appends a record for every closed workspace and panel, with cwd,
+   the app records closed workspaces, panels, and windows, with cwd,
    git branch, layout snapshot, the workspace's custom title, and — for a pane
    cmux has bound to an agent — a `resumeBinding` with the checkpoint id that
-   `cmux restore` takes. Primary source; nothing needs to run in the
-   background. Retention is bounded by the app.
+   `cmux restore` takes after a matching surface binding is installed. Primary
+   source; nothing needs to run in the background. Retention is bounded by the
+   app: cmux 0.64.24 defaults to 500 total records and at most 100 workspace
+   records, rather than a fixed number of days.
 2. **The cmux event log** (`~/.cmuxterm/events.jsonl`) — cmux appends every
    event here, but rotates it at 16 MiB with a single archive, so busy
    sessions age events out within a day. Each run of `cmux-ws-manager` harvests
@@ -154,14 +168,32 @@ Two sources, merged and deduplicated:
    `workspace.created` events used to drop workspaces that were later
    reopened.
 
-Open workspaces are enumerated across all windows via
-`cmux workspace list --json`, which also supplies their titles, and closed
+Open windows are read through `cmux list-windows --json`, followed by
+`cmux workspace list --json` for each window, which supplies workspace titles.
+A failed window query does not discard results from other windows. Closed
 entries matching an open workspace's id — or its directory and title — are
 filtered out (unless `--all`).
 
 Titles and paths come from those files, so they are treated as untrusted:
 control characters, tabs, newlines, and bidi overrides are neutralized before
 anything is displayed or printed.
+Malformed records are skipped, and unavailable history files do not prevent
+listing the remaining sources. Both the current native history envelope and
+legacy arrays of records are accepted.
+
+## Compatibility and checks
+
+Reviewed against cmux **0.64.24** (`f5da007dd`), including its changes since
+August 26, 2026. Newer private snapshot fields are ignored unless supported.
+
+The regression checks use Python's standard library, temporary home directories,
+and a fake `cmux`; they do not modify your cmux history:
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 -m py_compile cmux-ws-manager
+git diff --check
+```
 
 ## Install
 

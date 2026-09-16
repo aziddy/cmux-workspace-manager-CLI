@@ -26,6 +26,7 @@ and browser URLs.
 
 - `cmux-ws-manager`: executable and all application logic
 - `README.md`: user-facing behavior, installation, and limitations
+- `tests/test_cmux_ws_manager.py`: stdlib fixture checks with a temporary HOME and fake cmux
 - `COPYING` and `COPYING.LESSER`: LGPL-3.0-or-later license text
 - `.gitignore`: local Python and macOS artifacts
 
@@ -84,9 +85,10 @@ When changing CLI output or behavior, update `README.md` in the same change.
 
 ## Validation
 
-There is currently no automated test suite. At minimum, run:
+Run the stdlib compatibility checks and syntax validation:
 
 ```sh
+python3 -m unittest discover -s tests -v
 python3 -m py_compile cmux-ws-manager
 ```
 

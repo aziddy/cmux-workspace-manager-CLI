@@ -31,7 +31,7 @@ With no command this runs an interactive curses browser; it falls back to
 the plain listing whenever a terminal is not available or --no-interactive
 is given, so scripts and agents always get parseable text.
 """
-import json, locale, os, shlex, subprocess, sys, unicodedata
+import json, locale, math, os, shlex, subprocess, sys, unicodedata
 from datetime import datetime
 try:
     import curses  # importing is side-effect free; nothing touches the tty
@@ -44,9 +44,9 @@ HISTORY = os.path.join(LOG_DIR, "workspace-history.jsonl")
 NATIVE = os.path.expanduser(
     "~/Library/Application Support/cmux/closed-item-history-com.cmuxterm.app.json")
 APPLE_EPOCH = 978307200  # 2001-01-01 UTC, the reference for closedAt
-AGENT_RESUME = {"claude": "claude --resume {}", "codex": "codex resume {}"}
-GRAFT_WINDOW = 7 * 86400  # how far back a carried-over session may come from;
-                          # native history holds about a week either way
+AGENT_RESUME = {"claude": ["claude", "--resume"], "codex": ["codex", "resume"],
+                "opencode": ["opencode", "--session"]}
+GRAFT_WINDOW = 7 * 86400  # maximum age of a carried-over session
 
 HELP = """usage: {prog} [--all] [--no-interactive]
        {prog} reopen <n> [--plain]
@@ -54,7 +54,7 @@ HELP = """usage: {prog} [--all] [--no-interactive]
 List cmux workspaces you've closed, and reopen them.
 
 With no command this opens an interactive browser: up/down (or k/j) to move,
-enter to reopen, p to reopen empty, / to filter, ? for all keys, q or esc to
+enter to reopen, / to filter, ? for all keys, q or esc to
 quit. It prints the plain listing instead when output is not a terminal, when
 TERM is unset or "dumb", or with --no-interactive.
 
@@ -64,7 +64,7 @@ Commands:
 
 Options:
   --all             Show the raw close history instead of the default
-                    one-row-per-directory view.
+                    one-row-per-workspace view.
   --no-interactive  Skip the browser and print the plain listing.
   --plain           With reopen: skip layout restore and open an empty
                     workspace at the original directory.
@@ -74,118 +74,156 @@ reopen <n> numbering always follows the default view, so --all output is
 for inspection only.
 """
 
+def as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+def as_list(value):
+    return value if isinstance(value, list) else []
+
+def as_text(value):
+    return value if isinstance(value, str) and "\0" not in value else ""
+
 def parse_workspace_event(line):
-    if '"category":"workspace"' not in line:
-        return None
     try:
         ev = json.loads(line)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return None
-    if ev.get("category") == "workspace" and ev.get("id") and ev.get("workspace_id"):
+    ev = as_dict(ev)
+    if (ev.get("category") == "workspace" and as_text(ev.get("id"))
+            and as_text(ev.get("workspace_id")) and as_text(ev.get("name"))):
         return ev
     return None
 
 def load_events():
-    events = {}
-    if os.path.exists(HISTORY):
-        with open(HISTORY, errors="replace") as f:
-            for line in f:
-                ev = parse_workspace_event(line)
-                if ev:
-                    events[ev["id"]] = ev
-    fresh = []
-    for path in ROTATING:
-        if not os.path.exists(path):
-            continue
-        with open(path, errors="replace") as f:
-            for line in f:
-                ev = parse_workspace_event(line)
-                if ev and ev["id"] not in events:
-                    events[ev["id"]] = ev
-                    fresh.append(line.rstrip("\n"))
-    if fresh:
-        os.makedirs(LOG_DIR, exist_ok=True)
-        with open(HISTORY, "a") as f:
-            f.write("\n".join(fresh) + "\n")
+    events, fresh, writable = {}, [], True
+    for path in [HISTORY] + ROTATING:
+        try:
+            with open(path, errors="replace") as f:
+                for line in f:
+                    ev = parse_workspace_event(line)
+                    if ev and ev["id"] not in events:
+                        events[ev["id"]] = ev
+                        if path != HISTORY:
+                            fresh.append(line.rstrip("\n"))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            if path == HISTORY:
+                writable = False  # cannot deduplicate against unreadable history
+    if fresh and writable:
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            with open(HISTORY, "a") as f:
+                f.write("\n".join(fresh) + "\n")
+        except OSError:
+            pass  # the in-memory events are still usable for this listing
     return events
 
 def iso_to_unix(ts):
     try:
         return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, OverflowError, OSError):
         return 0
 
 def native_closed():
     try:
         with open(NATIVE) as f:
             d = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, RecursionError):
         return []
     out = []
-    for r in d.get("records", []):
-        w = r.get("entry", {}).get("workspace")
-        if not w:
+    records = d if isinstance(d, list) else as_dict(d).get("records")
+    for r in as_list(records):
+        r = as_dict(r)
+        closed_at = r.get("closedAt", 0)
+        try:
+            valid_time = type(closed_at) in (int, float) and math.isfinite(closed_at)
+        except OverflowError:
+            valid_time = False
+        if not valid_time:
             continue
-        inner = w.get("_0", w)
-        snap = inner.get("snapshot", {})
-        out.append({"ts": (r.get("closedAt") or 0) + APPLE_EPOCH,
-                    "id": inner.get("workspaceId") or snap.get("workspaceId") or "",
-                    "cwd": snap.get("currentDirectory") or "",
-                    "branch": (snap.get("gitBranch") or {}).get("branch") or "",
-                    "title": "", "custom": snap.get("customTitle") or "",
-                    "snapshot": snap})
+        entry = as_dict(r.get("entry"))
+        w = as_dict(entry.get("workspace"))
+        inner = as_dict(w.get("_0", w))
+        snapshots = [(inner.get("snapshot"), inner.get("workspaceId"))] if w else []
+        window = as_dict(entry.get("window"))
+        window = as_dict(window.get("_0", window))
+        manager = as_dict(as_dict(window.get("snapshot")).get("tabManager"))
+        window_ids = as_list(window.get("workspaceIds"))
+        for i, snap in enumerate(as_list(manager.get("workspaces"))):
+            wsid = as_text(as_dict(snap).get("workspaceId"))
+            snapshots.append((snap, wsid or (window_ids[i] if i < len(window_ids) else "")))
+        for snap, wsid in snapshots:
+            if not isinstance(snap, dict):
+                continue
+            out.append({"ts": closed_at + APPLE_EPOCH,
+                        "id": as_text(wsid) or as_text(snap.get("workspaceId")),
+                        "cwd": as_text(snap.get("currentDirectory")),
+                        "branch": as_text(as_dict(snap.get("gitBranch")).get("branch")),
+                        "title": "", "custom": as_text(snap.get("customTitle")),
+                        "snapshot": snap})
     return out
 
-def resume_command_for(term):
+def resume_command_for(term, bind_sessions=True):
     """Shell text that brings one pane's agent session back, or None.
 
-    `cmux restore <kind> <checkpoint-id>` relaunches cmux's own persisted
-    surface process, so the pane stays bound to the agent session and the
-    next close still records it — typing the provider's resume flag into a
-    plain shell does not, which silently drops the session one close later.
-    That flag remains the fallback for snapshots taken before resumeBinding
-    existed and for checkpoints cmux can no longer resolve.
+    Restore selectors identify a binding on the *calling surface*, not a
+    global checkpoint. Register a manual binding on the fresh surface first.
+    Only known provider argv is reconstructed; history's arbitrary commands,
+    environments, approval records, and hook provenance are not replayed.
     """
-    term = term or {}
-    binding, agent = term.get("resumeBinding") or {}, term.get("agent") or {}
-    cmds = []
-    kind, checkpoint = binding.get("kind"), binding.get("checkpointId")
-    if kind in AGENT_RESUME and checkpoint:
-        cmds.append(f"cmux restore {shlex.quote(kind)} {shlex.quote(checkpoint)}")
-    kind, sid = agent.get("kind"), agent.get("sessionId")
-    if kind in AGENT_RESUME and sid:
-        cmds.append(AGENT_RESUME[kind].format(shlex.quote(sid)))
-    if not cmds:
+    term = as_dict(term)
+    if remote_terminal(term):
         return None
-    # `cmux restore` replaces the process that calls it, so a chain starting
-    # with one runs in a subshell: the pane's own shell outlives the agent and
-    # is still there once it exits.
-    chain = " || ".join(cmds)
-    return f"({chain})" if cmds[0].startswith("cmux restore") else chain
+    for key, id_key in (("resumeBinding", "checkpointId"),
+                        ("managedAgentResumeBinding", "checkpointId"),
+                        ("agent", "sessionId")):
+        agent = as_dict(term.get(key))
+        kind, sid = as_text(agent.get("kind")), as_text(agent.get(id_key))
+        if kind not in AGENT_RESUME or not sid:
+            continue
+        # A leading dash could be parsed as a provider option, even when quoted.
+        if sid.startswith("-") or any(not c.isprintable() for c in sid):
+            return None
+        command = " ".join(shlex.quote(a) for a in AGENT_RESUME[kind] + [sid])
+        if not bind_sessions:
+            return command
+        target = '--workspace "$CMUX_WORKSPACE_ID" --surface "$CMUX_SURFACE_ID"'
+        selector = f"{shlex.quote(kind)} {shlex.quote(sid)}"
+        # Do not retry through a provider after cmux refuses a restore or after
+        # the resumed agent exits. execve only replaces the subshell below.
+        return (f"cmux surface resume set {target} --kind {shlex.quote(kind)} "
+                f"--checkpoint-id {shlex.quote(sid)} -- {command} >/dev/null && "
+                f'(cmux restore --surface "$CMUX_SURFACE_ID" {selector})')
+    return None
 
-def surface_for(panel, default_cwd):
-    if not panel:
-        return {"type": "terminal"}
+def surface_for(panel, default_cwd, bind_sessions=True):
+    panel = as_dict(panel)
+    s = {"type": "terminal"}
+    name = as_text(panel.get("customTitle"))
+    if name:
+        s["name"] = name
     browser = panel.get("browser")
-    if browser is not None:
-        s = {"type": "browser"}
-        if browser.get("urlString"):
-            s["url"] = browser["urlString"]
+    if isinstance(browser, dict):
+        s["type"] = "browser"
+        url = as_text(browser.get("urlString"))
+        if url:
+            s["url"] = url
         return s
-    term = panel.get("terminal") or {}
-    cwd = term.get("workingDirectory") or panel.get("directory") or default_cwd
+    term = as_dict(panel.get("terminal"))
+    cwd = as_text(term.get("workingDirectory")) or as_text(panel.get("directory")) or default_cwd
     parts = []
     if cwd:
+        s["cwd"] = cwd  # start the shell here, including its startup files
         parts.append(f"cd {shlex.quote(cwd)}")
-    resume = resume_command_for(term)
+    resume = resume_command_for(term, bind_sessions)
     if resume:
         parts.append(resume)
-    s = {"type": "terminal"}
     if parts:
         s["command"] = " && ".join(parts)
     return s
 
-def build_layout(snapshot):
+def build_layout(snapshot, bind_sessions=True):
     """Convert a closed-workspace snapshot into new-workspace --layout JSON.
 
     Snapshot layout is a binary tree of split/pane nodes; the --layout schema
@@ -193,32 +231,42 @@ def build_layout(snapshot):
     commands are typed into the pane's live shell, so `cd <dir> && <resume>`
     leaves a normal shell behind if (or after) the command exits.
     """
-    if not snapshot or not snapshot.get("layout"):
+    snapshot = as_dict(snapshot)
+    if not isinstance(snapshot.get("layout"), dict):
         return None
-    panels = {p.get("id"): p for p in snapshot.get("panels", [])}
-    default_cwd = snapshot.get("currentDirectory") or ""
+    panels = {as_text(p.get("id")): p for p in as_list(snapshot.get("panels"))
+              if isinstance(p, dict) and as_text(p.get("id"))}
+    default_cwd = as_text(snapshot.get("currentDirectory"))
 
     def convert(node):
+        if not isinstance(node, dict):
+            raise ValueError("invalid layout node")
         if node.get("type") == "split":
-            sp = node.get("split", {})
-            return {"direction": sp.get("orientation", "horizontal"),
-                    "split": sp.get("dividerPosition", 0.5),
-                    "children": [convert(sp.get("first", {})),
-                                 convert(sp.get("second", {}))]}
-        pane = node.get("pane", {})
-        surfaces = [surface_for(panels.get(pid), default_cwd)
-                    for pid in pane.get("panelIds", [])]
+            sp = as_dict(node.get("split"))
+            direction, ratio = sp.get("orientation", "horizontal"), sp.get("dividerPosition", 0.5)
+            if direction not in ("horizontal", "vertical"):
+                raise ValueError("invalid split direction")
+            if type(ratio) not in (int, float) or not 0 < ratio < 1:
+                ratio = 0.5
+            return {"direction": direction, "split": ratio,
+                    "children": [convert(sp.get("first")), convert(sp.get("second"))]}
+        if node.get("type") != "pane" or not isinstance(node.get("pane"), dict):
+            raise ValueError("invalid pane")
+        pane = node["pane"]
+        surfaces = [surface_for(panels.get(as_text(pid)), default_cwd, bind_sessions)
+                    for pid in as_list(pane.get("panelIds"))]
         return {"pane": {"surfaces": surfaces or [{"type": "terminal"}]}}
 
     try:
         return convert(snapshot["layout"])
-    except Exception:
+    except (ValueError, RecursionError):
         return None
 
 def agent_panels(snapshot):
     """Indexes of the panels in a snapshot that carry a resumable session."""
-    return [i for i, p in enumerate((snapshot or {}).get("panels") or [])
-            if p.get("browser") is None and resume_command_for(p.get("terminal"))]
+    return [i for i, p in enumerate(as_list(as_dict(snapshot).get("panels")))
+            if isinstance(p, dict) and p.get("browser") is None
+            and resume_command_for(p.get("terminal"))]
 
 def match_panel(donor, idx, panels, taken):
     """Pick the pane in `panels` that corresponds to a donor's agent pane.
@@ -227,14 +275,14 @@ def match_panel(donor, idx, panels, taken):
     regenerated — so the match is the pane title plus its working directory,
     then the same position, and only ever a pane with no session of its own.
     """
-    wd = (donor.get("terminal") or {}).get("workingDirectory") or None
+    wd = as_text(as_dict(donor.get("terminal")).get("workingDirectory")) or None
     title = donor.get("title")
 
     def free(j):
         p = panels[j]
         return (j not in taken and p.get("browser") is None
                 and not resume_command_for(p.get("terminal"))
-                and wd == ((p.get("terminal") or {}).get("workingDirectory") or None))
+                and wd == (as_text(as_dict(p.get("terminal")).get("workingDirectory")) or None))
 
     if title:
         for j, p in enumerate(panels):
@@ -247,34 +295,35 @@ def match_panel(donor, idx, panels, taken):
 def graft_agents(item, donors):
     """Carry an older close's agent bindings onto a newer agent-less snapshot.
 
-    A pane reopened by this tool is a plain terminal as far as cmux is
-    concerned, so closing a restored workspace writes a snapshot with no
-    binding at all — and that newer record is the one the default view keeps,
-    which is how a resumable session becomes unreachable. Donors are earlier
+    Older versions resumed agents without registering a surface binding, so
+    a later close could lose the session. That newer record is the one the
+    default view keeps, making the older session unreachable. Donors are earlier
     closes of the same workspace (see `identity`), newest first, so a session
     is never carried over from a different workspace that happens to share the
     directory; the item is left untouched when it has a session of its own or
     nothing matches.
     """
-    snap = item.get("snapshot")
-    if not snap or not snap.get("panels") or agent_panels(snap):
+    snap = as_dict(item.get("snapshot"))
+    if not as_list(snap.get("panels")) or agent_panels(snap) or remote_snapshot(snap):
         return item
     for donor in donors:
         if not (0 < item["ts"] - donor["ts"] <= GRAFT_WINDOW):
             continue
         dsnap = donor.get("snapshot") or {}
+        if remote_snapshot(dsnap):
+            continue
         sources = agent_panels(dsnap)
         if not sources:
             continue
-        panels, taken, moved = [dict(p) for p in snap["panels"]], set(), 0
+        panels, taken, moved = [dict(as_dict(p)) for p in snap["panels"]], set(), 0
         for i in sources:
             dp = dsnap["panels"][i]
             j = match_panel(dp, i, panels, taken)
             if j is None:
                 continue
-            term = dict(panels[j].get("terminal") or {})
-            for key in ("agent", "resumeBinding"):
-                if (dp.get("terminal") or {}).get(key):
+            term = dict(as_dict(panels[j].get("terminal")))
+            for key in ("agent", "resumeBinding", "managedAgentResumeBinding"):
+                if as_dict(dp.get("terminal")).get(key):
                     term[key] = dp["terminal"][key]
             panels[j]["terminal"] = term
             taken.add(j)
@@ -286,8 +335,9 @@ def graft_agents(item, donors):
 
 def restore_counts(snapshot):
     terms = agents = browsers = 0
-    for p in snapshot.get("panels", []):
-        if p.get("browser") is not None:
+    for p in as_list(as_dict(snapshot).get("panels")):
+        p = as_dict(p)
+        if isinstance(p.get("browser"), dict):
             browsers += 1
         elif resume_command_for(p.get("terminal")):
             agents += 1
@@ -298,6 +348,15 @@ def restore_counts(snapshot):
 def norm_path(p):
     return os.path.normpath(os.path.expanduser(p)) if p else ""
 
+def cmux_json(args):
+    try:
+        result = subprocess.run(["cmux"] + args + ["--json", "--id-format", "uuids"],
+                                capture_output=True, text=True, timeout=5,
+                                env={**os.environ, "CMUX_QUIET": "1"})
+        return json.loads(result.stdout) if result.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
 def open_workspaces():
     """Return (ids, cwds, titles) for every open workspace across all windows.
 
@@ -307,35 +366,42 @@ def open_workspaces():
     keeps that directory match from swallowing a second, differently named
     workspace on the same path.
     """
-    env = {**os.environ, "CMUX_QUIET": "1"}
     ids, cwds, titles = set(), set(), {}
-    try:
-        out = subprocess.run(["cmux", "list-windows"], capture_output=True,
-                             text=True, timeout=5, env=env).stdout
-        windows = [tok for line in out.splitlines() for tok in line.split()
-                   if len(tok) == 36 and tok.count("-") == 4]
-        for win in windows:
-            raw = subprocess.run(
-                ["cmux", "workspace", "list", "--json", "--window", win],
-                capture_output=True, text=True, timeout=5, env=env).stdout
-            for ws in json.loads(raw).get("workspaces", []):
-                if ws.get("id"):
-                    ids.add(ws["id"])
-                if ws.get("current_directory"):
-                    d = norm_path(ws["current_directory"])
-                    cwds.add(d)
-                    for key in ("custom_title", "title"):
-                        if ws.get(key):
-                            titles.setdefault(d, set()).add(ws[key].strip().casefold())
-        if windows:
-            return ids, cwds, titles
-    except Exception:
-        pass
+
+    def collect(data):
+        workspaces = as_dict(data).get("workspaces")
+        if not isinstance(workspaces, list):
+            return False
+        for ws in workspaces:
+            ws = as_dict(ws)
+            wsid, cwd = as_text(ws.get("id")), as_text(ws.get("current_directory"))
+            if wsid:
+                ids.add(wsid)
+            if cwd:
+                d = norm_path(cwd)
+                cwds.add(d)
+                for key in ("custom_title", "title"):
+                    title = as_text(ws.get(key)).strip().casefold()
+                    if title:
+                        titles.setdefault(d, set()).add(title)
+        return True
+
+    data = cmux_json(["list-windows"])
+    windows = data if isinstance(data, list) else as_dict(data).get("windows")
+    complete = bool(as_list(windows))
+    for win in as_list(windows):
+        win = as_dict(win)
+        handle = as_text(win.get("id")) or as_text(win.get("ref"))
+        if not handle or not collect(cmux_json(["workspace", "list", "--window", handle])):
+            complete = False  # keep checking the other windows after one fails
+    if complete or collect(cmux_json(["list-workspaces"])):
+        return ids, cwds, titles
     try:
         out = subprocess.run(["cmux", "list-workspaces", "--id-format", "uuids"],
-                             capture_output=True, text=True, timeout=5, env=env).stdout
+                             capture_output=True, text=True, timeout=5,
+                             env={**os.environ, "CMUX_QUIET": "1"}).stdout
         ids |= {tok for line in out.splitlines() for tok in line.split() if len(tok) == 36}
-    except Exception:
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         pass
     return ids, cwds, titles  # this fallback knows no directories or titles
 
@@ -367,18 +433,18 @@ def dir_occupied(it, open_cwds, open_titles):
 
 def entries(show_all=False):
     titles, ev_closed, created_at = {}, {}, {}
-    ordered = sorted(load_events().values(),
-                     key=lambda e: (e.get("occurred_at") or "", e.get("seq") or 0))
+    ordered = sorted(load_events().values(), key=lambda e: (
+        iso_to_unix(e.get("occurred_at")), e.get("seq") if type(e.get("seq")) is int else 0))
     for ev in ordered:
-        wsid, p = ev["workspace_id"], ev.get("payload", {})
-        title = p.get("custom_title") or p.get("title") or p.get("new_title")
+        wsid, p = ev["workspace_id"], as_dict(ev.get("payload"))
+        title = as_text(p.get("custom_title")) or as_text(p.get("title")) or as_text(p.get("new_title"))
         if title:
             titles[wsid] = title
         ts = iso_to_unix(ev.get("occurred_at"))
         if ev["name"] == "workspace.closed":
-            ev_closed[wsid] = {"ts": ts, "id": wsid, "cwd": p.get("cwd") or "",
+            ev_closed[wsid] = {"ts": ts, "id": wsid, "cwd": as_text(p.get("cwd")),
                                "branch": "", "title": title or "",
-                               "custom": p.get("custom_title") or ""}
+                               "custom": as_text(p.get("custom_title"))}
         elif ev["name"] == "workspace.created":
             ev_closed.pop(wsid, None)  # reopened (e.g. session restore)
             created_at[wsid] = max(created_at.get(wsid, 0), ts)
@@ -415,7 +481,10 @@ def entries(show_all=False):
     return out
 
 def when_of(it):
-    return datetime.fromtimestamp(it["ts"]).strftime("%b %d %H:%M") if it["ts"] else "?"
+    try:
+        return datetime.fromtimestamp(it["ts"]).strftime("%b %d %H:%M") if it["ts"] else "?"
+    except (ValueError, OverflowError, OSError):
+        return "?"
 
 def short_cwd(it, home):
     return it["cwd"].replace(home, "~", 1)
@@ -441,21 +510,52 @@ def do_reopen(it, plain=False):
     stdio is inherited (not captured) so cmux's own output and Ctrl-C keep
     working; the browser therefore tears curses down before calling this.
     """
+    snapshot = as_dict(it.get("snapshot"))
+    if not plain and remote_snapshot(snapshot):
+        print("Remote/cloud snapshots require cmux's native History menu; "
+              "--plain opens only a local shell.", file=sys.stderr)
+        return 1
     cmd = ["cmux", "new-workspace", "--name", it["title"]]
     if it["cwd"]:
         cmd += ["--cwd", it["cwd"]]
-    layout = None if plain else build_layout(it.get("snapshot"))
+    bind_sessions = False
+    if not plain and agent_panels(snapshot):
+        methods = as_list(as_dict(cmux_json(["capabilities"])).get("methods"))
+        bind_sessions = all(m in methods for m in ("surface.resume.set", "surface.resume.get"))
+    layout = None if plain else build_layout(snapshot, bind_sessions)
     if layout:
         cmd += ["--layout", json.dumps(layout)]
-    rc = subprocess.run(cmd).returncode
+    try:
+        rc = subprocess.run(cmd, timeout=30,
+                            env={**os.environ, "CMUX_QUIET": "1"}).returncode
+    except subprocess.TimeoutExpired:
+        print("cmux did not finish within 30 seconds; check for a new workspace "
+              "before retrying.", file=sys.stderr)
+        return 1
+    except OSError:
+        print("Could not run cmux; check that its CLI is installed and available on PATH.",
+              file=sys.stderr)
+        return 1
     if rc == 0 and layout:
         t, a, b = restore_counts(it["snapshot"])
         print(f"Restored {t} terminal(s), {a} AI session(s) resuming, {b} browser tab(s).")
         if a and it.get("grafted"):
             print("Its AI session came from an earlier close of this directory.")
     elif rc == 0 and not plain:
-        print("No snapshot for this entry; opened an empty workspace at its directory.")
+        print("No usable snapshot for this entry; opened an empty workspace at its directory.")
     return rc
+
+def remote_terminal(term):
+    term = as_dict(term)
+    return bool(term.get("isRemoteTerminal") or any(
+        as_dict(as_dict(term.get(key)).get("launchFlavor")).get("kind") not in (None, "local")
+        for key in ("resumeBinding", "managedAgentResumeBinding")))
+
+def remote_snapshot(snapshot):
+    snapshot = as_dict(snapshot)
+    return bool(snapshot.get("remote") or snapshot.get("cloudVM") or any(
+        remote_terminal(as_dict(p).get("terminal"))
+        for p in as_list(snapshot.get("panels"))))
 
 # --- interactive browser -------------------------------------------------
 #
@@ -569,7 +669,9 @@ def tui_colors():
 def badges(it):
     """What a reopen would restore — counts only, never session identifiers."""
     snap = it.get("snapshot")
-    if not snap:
+    if remote_snapshot(snap):
+        parts = ["remote snapshot"]
+    elif not snap:
         parts = ["no snapshot"]
     else:
         t, a, b = restore_counts(snap)
@@ -630,7 +732,7 @@ def draw_row(stdscr, st, y, num, it, selected, w):
     put(stdscr, y + 1, cwd_x, meta, rest, a["badge"])
 
 def hint_bar(st, w):
-    frags = ([st["up"] + st["down"] + " move", st["enter"] + " reopen", "p plain",
+    frags = ([st["up"] + st["down"] + " move", st["enter"] + " reopen",
               "/ search", "r refresh", "? keys", "q / esc quit"])
     while frags:
         s = "  ".join(frags)
@@ -732,7 +834,6 @@ def help_overlay(stdscr, st):
     lines = ["up / k        move up", "down / j      move down",
              "pgup pgdn     page", "home g / end G  first / last",
              "enter         reopen with its saved layout",
-             "p             reopen empty at the same directory",
              "/             filter by title or path",
              "esc           clear the filter, quit when none",
              "r             reload",
@@ -781,9 +882,9 @@ def tui_key(stdscr, st, k):
         tui_load(stdscr, st)
     elif k == "?":
         help_overlay(stdscr, st)
-    elif k in (10, 13, curses.KEY_ENTER, "p"):
+    elif k in (10, 13, curses.KEY_ENTER):
         if vis:
-            st["pick"] = (vis[st["sel"]], k == "p")
+            st["pick"] = vis[st["sel"]]
             return True
     elif k in ("q", 3):
         return True
@@ -876,8 +977,7 @@ def main():
         st = run_tui(show_all)
         if st is not None:  # curses ran, so the list was already loaded once
             if st["pick"]:
-                it, pick_plain = st["pick"]
-                sys.exit(do_reopen(it, pick_plain))
+                sys.exit(do_reopen(st["pick"]))
             return
     print_list(entries(show_all), show_all, prog)
 
