@@ -71,6 +71,7 @@ line, and `NO_COLOR` is honored in the picker.
 `reopen <n>` is the scriptable equivalent of pressing enter.
 The command-line option `reopen <n> --plain` opens an empty workspace at the
 saved directory and title, without restoring the layout or sessions.
+It also skips restoring the saved workspace color.
 
 Run `cmux-ws-manager --help` for the full option list. An unrecognized option
 is a usage error, not a silent no-op.
@@ -101,9 +102,16 @@ follows the default view.
 
 `reopen <n>` rebuilds the workspace from cmux's snapshot: split layout,
 terminals starting at their original directories, custom pane names, supported
-AI sessions, and browser URLs. It converts the snapshot's layout tree into a
-`cmux new-workspace --layout` call. Workspaces captured when an entire window
-was closed are listed individually and reopen in the caller's window.
+AI sessions, browser URLs, and the saved workspace color. It converts the
+snapshot's layout tree into a `cmux new-workspace --layout` call. Workspaces
+captured when an entire window was closed are listed individually and reopen
+in the caller's window.
+
+Workspace color comes from the selected snapshot's `customColor`. A valid saved
+color is applied to the newly created workspace, even if its layout is unusable
+and it reopens empty. Missing or malformed colors are skipped. If applying the
+color fails, a warning is printed and the workspace remains open; reopening
+still succeeds. Setting the color has a 5-second timeout.
 
 Supported AI providers are Claude Code, Codex, and OpenCode. With current cmux,
 each fresh terminal first registers a manual `cmux surface resume set` binding
@@ -143,8 +151,8 @@ connections. Other panel types (including file previews and embedded agent chat)
 become terminal placeholders. Agent resume requires the provider and its session
 files to still exist. Missing or malformed layout snapshots reopen empty.
 `reopen <n> --plain` opens an empty local workspace at the saved directory with
-the original title. Creation has a 30-second timeout; if it times out, check
-whether the workspace appeared before retrying.
+the original title, without restoring its saved color. Creation has a 30-second
+timeout; if it times out, check whether the workspace appeared before retrying.
 
 ## How it works
 
@@ -153,8 +161,8 @@ Two sources, merged and deduplicated:
 1. **cmux's native closed-item history**
    (`~/Library/Application Support/cmux/closed-item-history-<bundle-id>.json`) —
    the app records closed workspaces, panels, and windows, with cwd,
-   git branch, layout snapshot, the workspace's custom title, and — for a pane
-   cmux has bound to an agent — a `resumeBinding` with the checkpoint id that
+   git branch, layout snapshot, the workspace's custom title and color, and — for
+   a pane cmux has bound to an agent — a `resumeBinding` with the checkpoint id that
    `cmux restore` takes after a matching surface binding is installed. Primary
    source; nothing needs to run in the background. Retention is bounded by the
    app: cmux 0.64.24 defaults to 500 total records and at most 100 workspace

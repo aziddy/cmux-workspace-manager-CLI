@@ -31,7 +31,7 @@ With no command this runs an interactive curses browser; it falls back to
 the plain listing whenever a terminal is not available or --no-interactive
 is given, so scripts and agents always get parseable text.
 """
-import json, locale, math, os, shlex, subprocess, sys, unicodedata
+import json, locale, math, os, re, shlex, subprocess, sys, unicodedata
 from datetime import datetime
 try:
     import curses  # importing is side-effect free; nothing touches the tty
@@ -60,14 +60,15 @@ TERM is unset or "dumb", or with --no-interactive.
 
 Commands:
   reopen <n>        Rebuild workspace <n> from cmux's snapshot: split layout,
-                    terminal directories, AI panes resumed, browser tabs.
+                    terminal directories, AI panes resumed, browser tabs,
+                    and saved workspace color.
 
 Options:
   --all             Show the raw close history instead of the default
                     one-row-per-workspace view.
   --no-interactive  Skip the browser and print the plain listing.
-  --plain           With reopen: skip layout restore and open an empty
-                    workspace at the original directory.
+  --plain           With reopen: skip layout and color restore and open an
+                    empty workspace at the original directory.
   -h, --help        Show this message and exit.
 
 reopen <n> numbering always follows the default view, so --all output is
@@ -504,11 +505,26 @@ def print_list(items, show_all, prog):
     else:
         print(f"\nReopen one with: {prog} reopen <n>")
 
+def restore_color(color, output):
+    """Apply a saved color only to the handle returned by workspace creation."""
+    match = re.fullmatch(r"OK (workspace:[0-9]+|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}"
+                         r"-[0-9a-fA-F]{12})", output.strip())
+    if not match:
+        return False
+    try:
+        return subprocess.run(
+            ["cmux", "workspace-action", "--workspace", match[1],
+             "--action", "set-color", "--color", color],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+            env={**os.environ, "CMUX_QUIET": "1"}).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
 def do_reopen(it, plain=False):
     """Rebuild one closed workspace through cmux. Returns cmux's exit code.
 
-    stdio is inherited (not captured) so cmux's own output and Ctrl-C keep
-    working; the browser therefore tears curses down before calling this.
+    stdin/stderr are inherited; stdout is captured and replayed only when
+    needed to target a saved color. The browser tears curses down first.
     """
     snapshot = as_dict(it.get("snapshot"))
     if not plain and remote_snapshot(snapshot):
@@ -525,10 +541,21 @@ def do_reopen(it, plain=False):
     layout = None if plain else build_layout(snapshot, bind_sessions)
     if layout:
         cmd += ["--layout", json.dumps(layout)]
+    color = "" if plain else as_text(snapshot.get("customColor"))
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+        color = ""
     try:
-        rc = subprocess.run(cmd, timeout=30,
-                            env={**os.environ, "CMUX_QUIET": "1"}).returncode
-    except subprocess.TimeoutExpired:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE if color else None,
+                                text=True, errors="replace", timeout=30,
+                                env={**os.environ, "CMUX_QUIET": "1"})
+        rc = result.returncode
+        if color:
+            print(result.stdout, end="", flush=True)
+    except subprocess.TimeoutExpired as error:
+        if color and error.stdout:
+            output = error.stdout
+            print(output.decode(errors="replace") if isinstance(output, bytes) else output,
+                  end="", flush=True)
         print("cmux did not finish within 30 seconds; check for a new workspace "
               "before retrying.", file=sys.stderr)
         return 1
@@ -536,6 +563,8 @@ def do_reopen(it, plain=False):
         print("Could not run cmux; check that its CLI is installed and available on PATH.",
               file=sys.stderr)
         return 1
+    if rc == 0 and color and not restore_color(color, result.stdout):
+        print("Workspace opened, but its saved color could not be restored.", file=sys.stderr)
     if rc == 0 and layout:
         t, a, b = restore_counts(it["snapshot"])
         print(f"Restored {t} terminal(s), {a} AI session(s) resuming, {b} browser tab(s).")

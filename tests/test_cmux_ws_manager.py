@@ -41,7 +41,13 @@ elif command == "surface":
 elif command == "restore":
     sys.exit(config.get("restore_exit", 0))
 elif command == "new-workspace":
-    print("OK workspace:99")
+    print(config.get("create_output", "OK workspace:99\\n"), end="")
+    if config.get("create_error"):
+        print(config["create_error"], file=sys.stderr)
+    sys.exit(config.get("create_exit", 0))
+elif command == "workspace-action":
+    print("OK color-set")
+    sys.exit(config.get("color_exit", 0))
 else:
     sys.exit(2)
 '''
@@ -154,11 +160,16 @@ class CompatibilityTests(unittest.TestCase):
 
     def test_legacy_array_and_closed_window_workspaces(self):
         snaps = [snapshot("first"), snapshot("second", "/tmp/second")]
+        snaps[0]["customColor"] = "#EA8D3F"
         record = {"closedAt": 800000000, "entry": {"window": {"_0": {
             "workspaceIds": ["outdated-first", "outdated-second"],
             "snapshot": {"tabManager": {"workspaces": snaps + [None]}}}}}}
         self.native([record], legacy=True)
         self.assertEqual([it["id"] for it in self.manager.native_closed()], ["first", "second"])
+        result = self.run_cli("reopen", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls()[-1], ["workspace-action", "--workspace", "workspace:99",
+                                          "--action", "set-color", "--color", "#EA8D3F"])
 
     def test_open_windows_are_independent_and_titles_distinguish_workspaces(self):
         self.configure(windows=[{"id": "broken"}, {"id": "working"}],
@@ -276,6 +287,110 @@ class CompatibilityTests(unittest.TestCase):
         layout = [c for c in self.calls() if c[0] == "new-workspace"][-1]
         self.assertIn("codex resume session-123", layout[-1])
         self.assertNotIn("surface resume set", layout[-1])
+
+    def test_saved_color_targets_created_workspace_and_preserves_output(self):
+        for handle in ("workspace:99", "01234567-89ab-cdef-0123-456789abcdef"):
+            with self.subTest(handle=handle):
+                self.configure(create_output="OK " + handle + "\n", create_error="creation diagnostic")
+                path = self.native([closed(dict(snapshot(), customColor="#aB12eF"))])
+                original = path.read_bytes()
+                before = len(self.calls())
+                result = self.run_cli("reopen", "1")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.startswith("OK " + handle + "\nRestored "))
+                self.assertNotIn("color-set", result.stdout)
+                self.assertEqual(result.stderr, "creation diagnostic\n")
+                calls = self.calls()[before:]
+                self.assertEqual(calls[-1], ["workspace-action", "--workspace", handle,
+                                             "--action", "set-color", "--color", "#aB12eF"])
+                self.assertEqual(sum(c[0] == "new-workspace" for c in calls), 1)
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_plain_skips_saved_color(self):
+        self.native([closed(dict(snapshot(), customColor="#ABCDEF"))])
+        result = self.run_cli("reopen", "1", "--plain")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "OK workspace:99\n")
+        self.assertEqual(self.calls()[-1], ["new-workspace", "--name", "Project",
+                                          "--cwd", "/tmp/project"])
+        self.assertFalse(any(c[0] == "workspace-action" for c in self.calls()))
+
+    def test_missing_or_malformed_color_is_skipped(self):
+        for color in (None, "", [], {}, 123, "Blue", "#ABC", "#ABCDEF00", "#ABCDEG",
+                      "#ABCDEF\n", "#ABCDEF\0", "--help"):
+            with self.subTest(color=color):
+                self.native([closed(dict(snapshot(), customColor=color))])
+                result = self.run_cli("reopen", "1")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+        self.native([closed(snapshot())])
+        self.assertEqual(self.run_cli("reopen", "1").returncode, 0)
+        self.assertFalse(any(c[0] == "workspace-action" for c in self.calls()))
+
+    def test_saved_color_survives_unusable_layout(self):
+        self.native([closed(dict(snapshot(), customColor="#ABCDEF", layout=None))])
+        result = self.run_cli("reopen", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("No usable snapshot", result.stdout)
+        creation = [c for c in self.calls() if c[0] == "new-workspace"]
+        self.assertEqual(len(creation), 1)
+        self.assertNotIn("--layout", creation[0])
+        self.assertEqual(self.calls()[-1][0], "workspace-action")
+
+    def test_failed_creation_never_sets_color(self):
+        self.configure(create_exit=7)
+        self.native([closed(dict(snapshot(), customColor="#ABCDEF"))])
+        result = self.run_cli("reopen", "1")
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout, "OK workspace:99\n")
+        self.assertNotIn("Restored", result.stdout)
+        self.assertFalse(any(c[0] == "workspace-action" for c in self.calls()))
+
+    def test_unexpected_creation_output_warns_without_targeting_another_workspace(self):
+        self.native([closed(dict(snapshot(), customColor="#ABCDEF"))])
+        for output in ("", "OK", "OK current\n", "OK surface:99\n", "OK --help\n",
+                       "OK workspace:99\nOK workspace:100\n"):
+            with self.subTest(output=output):
+                self.configure(create_output=output)
+                result = self.run_cli("reopen", "1")
+                self.assertEqual(result.returncode, 0)
+                self.assertIn("Restored", result.stdout)
+                self.assertIn("saved color could not be restored", result.stderr)
+        self.assertFalse(any(c[0] == "workspace-action" for c in self.calls()))
+
+    def test_color_command_failure_keeps_workspace_open(self):
+        self.configure(color_exit=2)
+        self.native([closed(dict(snapshot(), customColor="#ABCDEF"))])
+        result = self.run_cli("reopen", "1")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Restored", result.stdout)
+        self.assertIn("saved color could not be restored", result.stderr)
+        self.assertEqual(sum(c[0] == "new-workspace" for c in self.calls()), 1)
+        self.assertFalse(any(c[0] == "close-workspace" for c in self.calls()))
+
+    def test_color_command_timeout_or_unavailable_keeps_success(self):
+        item = {"title": "Project", "cwd": "/tmp", "snapshot": {"customColor": "#ABCDEF"}}
+        created = subprocess.CompletedProcess([], 0, stdout="OK workspace:99\n")
+        for error in (FileNotFoundError(), subprocess.TimeoutExpired("cmux", 5)):
+            with self.subTest(error=type(error).__name__), mock.patch.object(
+                    self.manager.subprocess, "run", side_effect=[created, error]) as run, \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()) as output:
+                self.assertEqual(self.manager.do_reopen(item), 0)
+                self.assertIn("saved color could not be restored", output.getvalue())
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual(run.call_args.kwargs["timeout"], 5)
+
+    def test_colored_creation_timeout_replays_output_without_setting_color(self):
+        item = {"title": "Project", "cwd": "/tmp", "snapshot": {"customColor": "#ABCDEF"}}
+        error = subprocess.TimeoutExpired("cmux", 30, output=b"OK workspace:99\n")
+        with mock.patch.object(self.manager.subprocess, "run", side_effect=error) as run, \
+                contextlib.redirect_stdout(io.StringIO()) as output, \
+                contextlib.redirect_stderr(io.StringIO()) as diagnostic:
+            self.assertEqual(self.manager.do_reopen(item), 1)
+            self.assertEqual(output.getvalue(), "OK workspace:99\n")
+            self.assertIn("30 seconds", diagnostic.getvalue())
+            self.assertEqual(run.call_count, 1)
 
     def test_missing_or_malformed_snapshot_opens_empty(self):
         for layout in (None, [], {"type": "split", "split": None}):
