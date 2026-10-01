@@ -13,7 +13,7 @@ Run it with no arguments and you get an interactive picker:
   Closed workspaces                                                       3
 ──────────────────────────────────────────────────────────────────────────
 ▸   1  Aug 24 20:58   API rewrite             ~/code/api-server
-                                              feature/auth  2T  1AI  1web
+                                              group: API  feature/auth  2T  1AI  1web
     2  Aug 24 20:56   docs-site               ~/code/docs-site
                                               1T
     3  Aug 19 01:24   code                    ~/code
@@ -22,9 +22,10 @@ Run it with no arguments and you get an interactive picker:
 ```
 
 Arrow to a workspace, press enter, and it comes back. Each entry's second line
-shows the git branch and what a reopen would restore: terminals (`T`),
-resumable AI sessions (`AI`), and browser tabs (`web`). Entries cmux has no
+shows the saved group, git branch, and what a reopen would restore: terminals
+(`T`), resumable AI sessions (`AI`), and browser tabs (`web`). Entries cmux has no
 snapshot for say `no snapshot` — those can only be reopened empty.
+`group unknown` means cmux saved a group ID but its name is no longer available.
 
 `AI*` means the session was carried over from an earlier close of the same
 workspace — see [Sessions that outlive their snapshot](#sessions-that-outlive-their-snapshot).
@@ -41,7 +42,7 @@ those entries; the command-line `reopen <n> --plain` opens only a local shell.
 | `↑` `↓` / `k` `j` | move |
 | `PgUp` `PgDn` / `Home` `End` / `g` `G` | page, first, last |
 | `enter` | reopen with the saved layout, then exit |
-| `/` | filter by title or path; `enter` keeps it, `esc` clears it |
+| `/` | filter by title, path, or group; `enter` keeps it, `esc` clears it |
 | `r` | reload |
 | `?` | key help |
 | `q` / `esc` | quit without doing anything; `esc` clears an active filter first |
@@ -53,7 +54,7 @@ exits:
 
 ```
 $ cmux-ws-manager --no-interactive
-  1  Aug 24 20:58  API rewrite                  ~/code/api-server  [feature/auth]
+  1  Aug 24 20:58  API rewrite                  ~/code/api-server  [feature/auth]  (group: API)
   2  Aug 24 20:56  docs-site                    ~/code/docs-site
   3  Aug 19 01:24  code                         ~/code
 
@@ -71,7 +72,7 @@ line, and `NO_COLOR` is honored in the picker.
 `reopen <n>` is the scriptable equivalent of pressing enter.
 The command-line option `reopen <n> --plain` opens an empty workspace at the
 saved directory and title, without restoring the layout or sessions.
-It also skips restoring the saved workspace color.
+It also skips restoring the saved workspace color and group membership.
 
 Run `cmux-ws-manager --help` for the full option list. An unrecognized option
 is a usage error, not a silent no-op.
@@ -102,16 +103,42 @@ follows the default view.
 
 `reopen <n>` rebuilds the workspace from cmux's snapshot: split layout,
 terminals starting at their original directories, custom pane names, supported
-AI sessions, browser URLs, and the saved workspace color. It converts the
-snapshot's layout tree into a `cmux new-workspace --layout` call. Workspaces
-captured when an entire window was closed are listed individually and reopen
-in the caller's window.
+AI sessions, browser URLs, saved workspace color, and group membership. It
+converts the snapshot's layout tree into a `cmux new-workspace --layout` call. Workspaces
+captured when an entire window was closed are listed individually. Reopening
+uses the caller's window unless the saved group still exists in another window.
 
 Workspace color comes from the selected snapshot's `customColor`. A valid saved
 color is applied to the newly created workspace, even if its layout is unusable
 and it reopens empty. Missing or malformed colors are skipped. If applying the
 color fails, a warning is printed and the workspace remains open; reopening
 still succeeds. Setting the color has a 5-second timeout.
+
+Workspace groups are matched by their saved ID. A reopened workspace joins the
+existing group in its current window, even if that differs from the caller's
+window. If the group is gone and its name can be recovered, a group with that
+name is created in the caller's window. cmux also creates a fresh shell workspace
+for its group header. Recreated groups use cmux's default appearance and ordering;
+existing groups retain their settings. The saved layout and color can still be
+restored when group restoration fails, and group membership can still be restored
+when the layout is unusable.
+
+Group names come from closed-window snapshots, live groups, cmux's current and
+previous saved sessions, and the local `~/.cmuxterm/workspace-groups.json` catalog.
+A closed-window entry keeps the name saved with that window; other entries use
+the latest dated observation. Each run remembers observed names in the catalog,
+so they can survive a group's deletion. The catalog also maps original IDs to
+recreated groups, letting later reopens reuse them. Groups with identical names
+are kept separate. The catalog contains only group names, IDs, and timestamps;
+cmux's history and session files are never edited.
+
+Records without a saved group ID receive no inferred group. If the name is lost,
+cmux lacks the group API, or live queries cannot establish that a group is gone,
+reopening proceeds without restoring membership and prints a warning. A failed
+group operation also leaves the new workspace open and reopening still succeeds.
+Group calls have 5-second timeouts. An unavailable catalog does not prevent
+listing or reopening; if a recreation mapping cannot be saved, a warning explains
+that future reopens may not reuse that group.
 
 Supported AI providers are Claude Code, Codex, and OpenCode. With current cmux,
 each fresh terminal first registers a manual `cmux surface resume set` binding
@@ -146,13 +173,13 @@ mismatch resumes the conversation one pane over, at the right directory.
 `--all` never grafts: it is the raw close history.
 
 Not restorable: scrollback, running non-agent processes, browser profiles and
-back/forward history, canvas positions, workspace groups, or SSH/cloud
+back/forward history, canvas positions, or SSH/cloud
 connections. Other panel types (including file previews and embedded agent chat)
 become terminal placeholders. Agent resume requires the provider and its session
 files to still exist. Missing or malformed layout snapshots reopen empty.
 `reopen <n> --plain` opens an empty local workspace at the saved directory with
-the original title, without restoring its saved color. Creation has a 30-second
-timeout; if it times out, check whether the workspace appeared before retrying.
+the original title, without restoring its saved color or group. Creation has a
+30-second timeout; if it times out, check whether the workspace appeared before retrying.
 
 ## How it works
 
@@ -161,8 +188,8 @@ Two sources, merged and deduplicated:
 1. **cmux's native closed-item history**
    (`~/Library/Application Support/cmux/closed-item-history-<bundle-id>.json`) —
    the app records closed workspaces, panels, and windows, with cwd,
-   git branch, layout snapshot, the workspace's custom title and color, and — for
-   a pane cmux has bound to an agent — a `resumeBinding` with the checkpoint id that
+   git branch, layout snapshot, the workspace's custom title, color, and group ID,
+   and — for a pane cmux has bound to an agent — a `resumeBinding` with the checkpoint id that
    `cmux restore` takes after a matching surface binding is installed. Primary
    source; nothing needs to run in the background. Retention is bounded by the
    app: cmux 0.64.24 defaults to 500 total records and at most 100 workspace
@@ -178,12 +205,15 @@ Two sources, merged and deduplicated:
 
 Open windows are read through `cmux list-windows --json`, followed by
 `cmux workspace list --json` for each window, which supplies workspace titles.
+`cmux workspace-group list --json` supplies group names and owning windows when
+the API is available. Group information adds labels and restoration without
+changing which entries are hidden, collapsed, or numbered.
 A failed window query does not discard results from other windows. Closed
 entries matching an open workspace's id — or its directory and title — are
 filtered out (unless `--all`).
 
-Titles and paths come from those files, so they are treated as untrusted:
-control characters, tabs, newlines, and bidi overrides are neutralized before
+Titles, paths, and group names come from those files, so they are treated as
+untrusted: control characters, tabs, newlines, and bidi overrides are neutralized before
 anything is displayed or printed.
 Malformed records are skipped, and unavailable history files do not prevent
 listing the remaining sources. Both the current native history envelope and
@@ -193,6 +223,7 @@ legacy arrays of records are accepted.
 
 Reviewed against cmux **0.64.24** (`f5da007dd`), including its changes since
 August 26, 2026. Newer private snapshot fields are ignored unless supported.
+Group recovery also supports the workspace-group CLI in **0.64.25** (`b685a275c`).
 
 The regression checks use Python's standard library, temporary home directories,
 and a fake `cmux`; they do not modify your cmux history:

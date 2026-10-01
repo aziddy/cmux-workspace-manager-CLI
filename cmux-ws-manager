@@ -19,7 +19,7 @@
 Primary source: cmux's own closed-item history
 (~/Library/Application Support/cmux/closed-item-history-*.json), which the
 app maintains for every closed workspace and panel. It stores cwd, layout,
-git branch, and the workspace's custom title; its retention is bounded.
+git branch, the workspace's custom title, and group ID; its retention is bounded.
 
 Supplement: workspace-category events harvested from the rotating
 ~/.cmuxterm/events.jsonl logs into ~/.cmuxterm/workspace-history.jsonl on
@@ -27,11 +27,14 @@ every run. These supply titles for records that predate customTitle, closes
 older than the native retention, and workspace.created events used to drop
 reopened workspaces.
 
+Group names are recovered from window snapshots, live groups, saved sessions,
+and ~/.cmuxterm/workspace-groups.json, which remembers names and recreated IDs.
+
 With no command this runs an interactive curses browser; it falls back to
 the plain listing whenever a terminal is not available or --no-interactive
 is given, so scripts and agents always get parseable text.
 """
-import json, locale, math, os, re, shlex, subprocess, sys, unicodedata
+import json, locale, math, os, re, shlex, subprocess, sys, tempfile, unicodedata
 from datetime import datetime
 try:
     import curses  # importing is side-effect free; nothing touches the tty
@@ -43,6 +46,10 @@ ROTATING = [os.path.join(LOG_DIR, "events.jsonl.1"), os.path.join(LOG_DIR, "even
 HISTORY = os.path.join(LOG_DIR, "workspace-history.jsonl")
 NATIVE = os.path.expanduser(
     "~/Library/Application Support/cmux/closed-item-history-com.cmuxterm.app.json")
+SESSIONS = [os.path.join(os.path.dirname(NATIVE), name) for name in
+            ("session-com.cmuxterm.app-previous.json", "session-com.cmuxterm.app.json")]
+GROUPS = os.path.join(LOG_DIR, "workspace-groups.json")
+UUID_PATTERN = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
 APPLE_EPOCH = 978307200  # 2001-01-01 UTC, the reference for closedAt
 AGENT_RESUME = {"claude": ["claude", "--resume"], "codex": ["codex", "resume"],
                 "opencode": ["opencode", "--session"]}
@@ -61,18 +68,20 @@ TERM is unset or "dumb", or with --no-interactive.
 Commands:
   reopen <n>        Rebuild workspace <n> from cmux's snapshot: split layout,
                     terminal directories, AI panes resumed, browser tabs,
-                    and saved workspace color.
+                    saved workspace color, and workspace group.
 
 Options:
   --all             Show the raw close history instead of the default
                     one-row-per-workspace view.
   --no-interactive  Skip the browser and print the plain listing.
-  --plain           With reopen: skip layout and color restore and open an
+  --plain           With reopen: skip layout, color, and group restore; open an
                     empty workspace at the original directory.
   -h, --help        Show this message and exit.
 
 reopen <n> numbering always follows the default view, so --all output is
 for inspection only.
+Search matches title, path, or saved group name. Reopening follows an existing
+group into its window, or recreates a missing named group in the caller's window.
 """
 
 def as_dict(value):
@@ -83,6 +92,93 @@ def as_list(value):
 
 def as_text(value):
     return value if isinstance(value, str) and "\0" not in value else ""
+
+def as_uuid(value):
+    value = as_text(value)
+    return value.lower() if re.fullmatch(UUID_PATTERN, value) else ""
+
+def finite_number(value):
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        return False
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return None
+
+def remember_group(catalog, group_id, name, ts):
+    group_id, name = as_uuid(group_id), as_text(name).strip()
+    ts = ts if finite_number(ts) else 0
+    if group_id and name and ts >= catalog["groups"].get(group_id, {}).get("ts", 0):
+        catalog["groups"][group_id] = {"name": name, "ts": ts}
+
+def load_group_catalog():
+    catalog = {"version": 1, "groups": {}, "aliases": {}}
+    data = as_dict(read_json(GROUPS))
+    if type(data.get("version")) is not int or data["version"] != 1:
+        return catalog
+    for group_id, info in as_dict(data.get("groups")).items():
+        info = as_dict(info)
+        remember_group(catalog, group_id, info.get("name"), info.get("ts"))
+    for source, target in as_dict(data.get("aliases")).items():
+        source, target = as_uuid(source), as_uuid(target)
+        if source and target and source != target:
+            catalog["aliases"][source] = target
+    return catalog
+
+def save_group_catalog(catalog):
+    """Atomically store names and recreated identities, never session payloads."""
+    if not catalog["groups"] and not catalog["aliases"]:
+        return True
+    old = read_json(GROUPS)
+    if old == catalog:
+        return True
+    if isinstance(old, dict) and old.get("version") not in (None, 1):
+        return False  # do not overwrite a newer catalog format
+    temporary = None
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", dir=LOG_DIR,
+                                         prefix=".workspace-groups-", delete=False) as f:
+            temporary = f.name
+            json.dump(catalog, f, allow_nan=False)
+            f.write("\n")
+        os.replace(temporary, GROUPS)
+        return True
+    except (OSError, ValueError):
+        return False
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+def session_groups(catalog):
+    for path in SESSIONS:
+        data = as_dict(read_json(path))
+        for window in as_list(data.get("windows")):
+            manager = as_dict(as_dict(window).get("tabManager"))
+            for group in as_list(manager.get("workspaceGroups")):
+                group = as_dict(group)
+                remember_group(catalog, group.get("id"), group.get("name"), data.get("createdAt"))
+
+def group_ids(group_id, catalog):
+    """Follow recreated identities without trusting cycles in the local cache."""
+    seen = set()
+    while group_id and group_id not in seen:
+        yield group_id
+        seen.add(group_id)
+        group_id = catalog["aliases"].get(group_id, "")
+
+def group_name(group_id, catalog):
+    names = [catalog["groups"][gid] for gid in group_ids(group_id, catalog)
+             if gid in catalog["groups"]]
+    return max(names, key=lambda n: n["ts"])["name"] if names else ""
 
 def parse_workspace_event(line):
     try:
@@ -126,43 +222,45 @@ def iso_to_unix(ts):
     except (ValueError, AttributeError, OverflowError, OSError):
         return 0
 
-def native_closed():
-    try:
-        with open(NATIVE) as f:
-            d = json.load(f)
-    except (OSError, ValueError, RecursionError):
-        return []
+def native_closed(catalog=None):
+    d = read_json(NATIVE)
     out = []
     records = d if isinstance(d, list) else as_dict(d).get("records")
     for r in as_list(records):
         r = as_dict(r)
         closed_at = r.get("closedAt", 0)
-        try:
-            valid_time = type(closed_at) in (int, float) and math.isfinite(closed_at)
-        except OverflowError:
-            valid_time = False
-        if not valid_time:
+        if not finite_number(closed_at):
             continue
         entry = as_dict(r.get("entry"))
         w = as_dict(entry.get("workspace"))
         inner = as_dict(w.get("_0", w))
-        snapshots = [(inner.get("snapshot"), inner.get("workspaceId"))] if w else []
+        snapshots = [(inner.get("snapshot"), inner.get("workspaceId"), {})] if w else []
         window = as_dict(entry.get("window"))
         window = as_dict(window.get("_0", window))
         manager = as_dict(as_dict(window.get("snapshot")).get("tabManager"))
+        names = {}
+        for group in as_list(manager.get("workspaceGroups")):
+            group = as_dict(group)
+            group_id, name = as_uuid(group.get("id")), as_text(group.get("name")).strip()
+            if group_id and name:
+                names[group_id] = name
+                if catalog is not None:
+                    remember_group(catalog, group_id, name, closed_at + APPLE_EPOCH)
         window_ids = as_list(window.get("workspaceIds"))
         for i, snap in enumerate(as_list(manager.get("workspaces"))):
             wsid = as_text(as_dict(snap).get("workspaceId"))
-            snapshots.append((snap, wsid or (window_ids[i] if i < len(window_ids) else "")))
-        for snap, wsid in snapshots:
+            snapshots.append((snap, wsid or (window_ids[i] if i < len(window_ids) else ""), names))
+        for snap, wsid, names in snapshots:
             if not isinstance(snap, dict):
                 continue
+            group_id = as_uuid(snap.get("groupId"))
             out.append({"ts": closed_at + APPLE_EPOCH,
                         "id": as_text(wsid) or as_text(snap.get("workspaceId")),
                         "cwd": as_text(snap.get("currentDirectory")),
                         "branch": as_text(as_dict(snap.get("gitBranch")).get("branch")),
                         "title": "", "custom": as_text(snap.get("customTitle")),
-                        "snapshot": snap})
+                        "snapshot": snap, "group_id": group_id,
+                        "group_name": names.get(group_id, "")})
     return out
 
 def resume_command_for(term, bind_sessions=True):
@@ -352,13 +450,58 @@ def norm_path(p):
 def cmux_json(args):
     try:
         result = subprocess.run(["cmux"] + args + ["--json", "--id-format", "uuids"],
-                                capture_output=True, text=True, timeout=5,
+                                capture_output=True, text=True, errors="replace", timeout=5,
                                 env={**os.environ, "CMUX_QUIET": "1"})
         return json.loads(result.stdout) if result.returncode == 0 else None
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+    except (OSError, ValueError, RecursionError, subprocess.TimeoutExpired):
         return None
 
-def open_workspaces():
+def cmux_windows():
+    data = cmux_json(["list-windows"])
+    return data if isinstance(data, list) else as_dict(data).get("windows")
+
+def live_groups(windows, methods):
+    """Return live groups and whether their absence can be established globally."""
+    if "workspace.group.list" not in methods:
+        return {}, False
+    groups, ambiguous = {}, set()
+    complete = bool(as_list(windows))
+    # A current-window fallback can recover a known group, but cannot prove
+    # that a missing one does not exist in another window.
+    for window in as_list(windows) or [None]:
+        window = as_dict(window)
+        handle = as_uuid(window.get("id")) or as_text(window.get("ref"))
+        if as_list(windows) and not re.fullmatch(r"window:[0-9]+|" + UUID_PATTERN, handle):
+            complete = False
+            continue
+        data = as_dict(cmux_json(["workspace-group", "list"] +
+                                (["--window", handle] if handle else [])))
+        records = data.get("groups")
+        owner = as_uuid(data.get("window_id")) or handle
+        if not isinstance(records, list) or not owner:
+            complete = False
+            continue
+        for group in records:
+            group = as_dict(group)
+            group_id = as_uuid(group.get("id"))
+            if not group_id:
+                complete = False
+                continue
+            if group_id in groups or group_id in ambiguous:
+                complete = False
+                ambiguous.add(group_id)
+                groups.pop(group_id, None)
+                continue
+            groups[group_id] = {"id": group_id, "name": as_text(group.get("name")).strip(),
+                                "window": owner}
+    return groups, complete
+
+def remember_live_groups(catalog, groups):
+    now = datetime.now().timestamp()
+    for group in groups.values():
+        remember_group(catalog, group["id"], group["name"], now)
+
+def open_workspaces(windows=None):
     """Return (ids, cwds, titles) for every open workspace across all windows.
 
     A reopened directory gets a new workspace UUID, so the id check alone is
@@ -387,8 +530,8 @@ def open_workspaces():
                         titles.setdefault(d, set()).add(title)
         return True
 
-    data = cmux_json(["list-windows"])
-    windows = data if isinstance(data, list) else as_dict(data).get("windows")
+    if windows is None:
+        windows = cmux_windows()
     complete = bool(as_list(windows))
     for win in as_list(windows):
         win = as_dict(win)
@@ -449,11 +592,21 @@ def entries(show_all=False):
         elif ev["name"] == "workspace.created":
             ev_closed.pop(wsid, None)  # reopened (e.g. session restore)
             created_at[wsid] = max(created_at.get(wsid, 0), ts)
-    native = native_closed()
+    catalog = load_group_catalog()
+    native = native_closed(catalog)
+    session_groups(catalog)
     native_ids = {n["id"] for n in native}
     items = [n for n in native if created_at.get(n["id"], 0) <= n["ts"]]
     items += [e for e in ev_closed.values() if e["id"] not in native_ids]
-    open_ids, open_cwds, open_titles = open_workspaces()
+    windows = cmux_windows()
+    open_ids, open_cwds, open_titles = open_workspaces(as_list(windows))
+    methods = as_list(as_dict(cmux_json(["capabilities"])).get("methods"))
+    groups, _ = live_groups(windows, methods)
+    remember_live_groups(catalog, groups)
+    save_group_catalog(catalog)
+    for it in items:
+        if it.get("group_id") and not it["group_name"]:
+            it["group_name"] = group_name(it["group_id"], catalog)
     items = [it for it in items if it["id"] not in open_ids]
     if not show_all:
         items = [it for it in items
@@ -490,6 +643,12 @@ def when_of(it):
 def short_cwd(it, home):
     return it["cwd"].replace(home, "~", 1)
 
+def group_label(it):
+    if not it.get("group_id"):
+        return ""
+    name = as_text(it.get("group_name"))
+    return "group: " + name if name else "group unknown"
+
 def print_list(items, show_all, prog):
     if not items:
         print("No closed workspaces found.")
@@ -498,33 +657,76 @@ def print_list(items, show_all, prog):
     for i, it in enumerate(items, 1):
         branch = f"  [{sanitize(it['branch'])}]" if it["branch"] else ""
         taken = "  (dir open)" if it.get("dir_open") else ""
+        group = f"  ({sanitize(group_label(it))})" if group_label(it) else ""
         print(f"{i:>3}  {when_of(it):<13} {sanitize(it['title']):<28} "
-              f"{sanitize(short_cwd(it, home))}{branch}{taken}")
+              f"{sanitize(short_cwd(it, home))}{branch}{taken}{group}")
     if show_all:
         print("\n(--all view; reopen numbering follows the default filtered list)")
     else:
         print(f"\nReopen one with: {prog} reopen <n>")
 
-def restore_color(color, output):
-    """Apply a saved color only to the handle returned by workspace creation."""
-    match = re.fullmatch(r"OK (workspace:[0-9]+|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}"
-                         r"-[0-9a-fA-F]{12})", output.strip())
-    if not match:
-        return False
+def created_workspace(output):
+    match = re.fullmatch(r"OK (workspace:[0-9]+|" + UUID_PATTERN + r")", as_text(output).strip())
+    return match[1] if match else ""
+
+def cmux_ok(args):
     try:
         return subprocess.run(
-            ["cmux", "workspace-action", "--workspace", match[1],
-             "--action", "set-color", "--color", color],
+            ["cmux"] + args,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
             env={**os.environ, "CMUX_QUIET": "1"}).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 
+def restore_color(color, output):
+    """Apply a saved color only to the handle returned by workspace creation."""
+    handle = created_workspace(output)
+    return bool(handle) and cmux_ok(["workspace-action", "--workspace", handle,
+                                    "--action", "set-color", "--color", color])
+
+def prepare_group(it, group_id, methods):
+    catalog = load_group_catalog()
+    session_groups(catalog)
+    groups, complete = live_groups(cmux_windows(), methods)
+    remember_live_groups(catalog, groups)
+    save_group_catalog(catalog)
+    target = None
+    if "workspace.group.add" in methods:
+        target = next((groups[gid] for gid in group_ids(group_id, catalog) if gid in groups), None)
+    return {"id": group_id, "name": as_text(it.get("group_name")) or group_name(group_id, catalog),
+            "target": target, "complete": complete, "catalog": catalog, "methods": methods}
+
+def restore_group(group, output, cwd):
+    """Adopt only the newly created workspace; a group failure never closes it."""
+    handle, target = created_workspace(output), group["target"]
+    if not handle:
+        return False
+    if target:
+        return cmux_ok(["workspace-group", "add", "--group", target["id"],
+                        "--workspace", handle, "--window", target["window"]])
+    if (not group["complete"] or not group["name"] or
+            "workspace.group.create" not in group["methods"] or
+            "workspace.group.add" not in group["methods"]):
+        return False
+    args = ["workspace-group", "create", "--name", group["name"], "--from", handle]
+    if cwd:
+        args += ["--cwd", cwd]
+    created = as_dict(as_dict(cmux_json(args)).get("group"))
+    group_id = as_uuid(created.get("id"))
+    if not group_id:
+        return False
+    catalog = group["catalog"]
+    remember_group(catalog, group_id, created.get("name") or group["name"], datetime.now().timestamp())
+    catalog["aliases"][group["id"]] = group_id
+    if not save_group_catalog(catalog):
+        print("Workspace group restored, but its local group mapping could not be saved.", file=sys.stderr)
+    return True
+
 def do_reopen(it, plain=False):
     """Rebuild one closed workspace through cmux. Returns cmux's exit code.
 
     stdin/stderr are inherited; stdout is captured and replayed only when
-    needed to target a saved color. The browser tears curses down first.
+    needed to target a saved color or group. The browser tears curses down first.
     """
     snapshot = as_dict(it.get("snapshot"))
     if not plain and remote_snapshot(snapshot):
@@ -534,25 +736,30 @@ def do_reopen(it, plain=False):
     cmd = ["cmux", "new-workspace", "--name", it["title"]]
     if it["cwd"]:
         cmd += ["--cwd", it["cwd"]]
-    bind_sessions = False
-    if not plain and agent_panels(snapshot):
+    group_id = "" if plain else as_uuid(snapshot.get("groupId"))
+    methods = []
+    if not plain and (group_id or agent_panels(snapshot)):
         methods = as_list(as_dict(cmux_json(["capabilities"])).get("methods"))
-        bind_sessions = all(m in methods for m in ("surface.resume.set", "surface.resume.get"))
+    group = prepare_group(it, group_id, methods) if group_id else None
+    if group and group["target"]:
+        cmd += ["--window", group["target"]["window"]]
+    bind_sessions = all(m in methods for m in ("surface.resume.set", "surface.resume.get"))
     layout = None if plain else build_layout(snapshot, bind_sessions)
     if layout:
         cmd += ["--layout", json.dumps(layout)]
     color = "" if plain else as_text(snapshot.get("customColor"))
     if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
         color = ""
+    capture = bool(color or group)
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE if color else None,
+        result = subprocess.run(cmd, stdout=subprocess.PIPE if capture else None,
                                 text=True, errors="replace", timeout=30,
                                 env={**os.environ, "CMUX_QUIET": "1"})
         rc = result.returncode
-        if color:
+        if capture:
             print(result.stdout, end="", flush=True)
     except subprocess.TimeoutExpired as error:
-        if color and error.stdout:
+        if capture and error.stdout:
             output = error.stdout
             print(output.decode(errors="replace") if isinstance(output, bytes) else output,
                   end="", flush=True)
@@ -565,6 +772,8 @@ def do_reopen(it, plain=False):
         return 1
     if rc == 0 and color and not restore_color(color, result.stdout):
         print("Workspace opened, but its saved color could not be restored.", file=sys.stderr)
+    if rc == 0 and group and not restore_group(group, result.stdout, it["cwd"]):
+        print("Workspace opened, but its saved group could not be restored.", file=sys.stderr)
     if rc == 0 and layout:
         t, a, b = restore_counts(it["snapshot"])
         print(f"Restored {t} terminal(s), {a} AI session(s) resuming, {b} browser tab(s).")
@@ -606,7 +815,7 @@ def tui_available():
 def sanitize(s, ascii_only=False):
     """Strip anything that would move the cursor or reorder a line.
 
-    Titles and paths come from history files we treat as untrusted, so tabs,
+    Titles, paths and group names come from files we treat as untrusted, so tabs,
     newlines, escapes, and bidi overrides all collapse to spaces. On an ASCII
     terminal the rest is transliterated here, because ncurses would otherwise
     silently blank the glyphs it cannot encode and leave the row unreadable.
@@ -718,7 +927,7 @@ def visible(st):
     if not q:
         return items
     return [it for it in items
-            if q in (it["title"] or "").casefold() or q in (it["cwd"] or "").casefold()]
+            if any(q in (it.get(key) or "").casefold() for key in ("title", "cwd", "group_name"))]
 
 def clamp_view(sel, off, rows, n, margin=1):
     """Clamp the selection into the list and slide the viewport onto it.
@@ -737,7 +946,7 @@ def clamp_view(sel, off, rows, n, margin=1):
     return sel, max(0, min(off, max(0, n - rows)))
 
 def draw_row(stdscr, st, y, num, it, selected, w):
-    """Two lines: identity on the first, git branch and restore counts below."""
+    """Two lines: identity on the first, group, branch and restore counts below."""
     a, ell, asc = st["attr"], st["ell"], st["ascii"]
     tw = min(28, max(8, (w - MARK_W - NUM_W - WHEN_W - 2) // 2))  # title and
     cwd_x = MARK_W + NUM_W + WHEN_W + tw + 2              # path split what is left
@@ -747,7 +956,8 @@ def draw_row(stdscr, st, y, num, it, selected, w):
     when = pad(when_of(it), WHEN_W)
     title = fit(sanitize(it["title"], asc), tw, ell)
     cwd = fit(sanitize(short_cwd(it, st["home"]), asc), rest, ell)
-    meta = fit("  ".join(x for x in (sanitize(it["branch"], asc), badges(it)) if x),
+    meta = fit("  ".join(x for x in (sanitize(group_label(it), asc),
+                                   sanitize(it["branch"], asc), badges(it)) if x),
                rest, ell)
     if selected:  # one attribute for the whole bar; mixing a color pair with
         put(stdscr, y, 0,     # A_REVERSE is unreadable on many terminals
@@ -863,7 +1073,7 @@ def help_overlay(stdscr, st):
     lines = ["up / k        move up", "down / j      move down",
              "pgup pgdn     page", "home g / end G  first / last",
              "enter         reopen with its saved layout",
-             "/             filter by title or path",
+             "/             filter by title, path, or group",
              "esc           clear the filter, quit when none",
              "r             reload",
              "?             this help", "q             quit", "",

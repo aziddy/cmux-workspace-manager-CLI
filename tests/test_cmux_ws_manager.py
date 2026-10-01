@@ -18,6 +18,12 @@ from unittest import mock
 
 
 CLI = Path(__file__).resolve().parents[1] / "cmux-ws-manager"
+GROUP_A = "11111111-1111-4111-8111-111111111111"
+GROUP_B = "22222222-2222-4222-8222-222222222222"
+GROUP_C = "33333333-3333-4333-8333-333333333333"
+WINDOW_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+WINDOW_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+GROUP_METHODS = ["workspace.group.list", "workspace.group.add", "workspace.group.create"]
 FAKE_CMUX = '''
 import json, os, sys
 from pathlib import Path
@@ -48,6 +54,28 @@ elif command == "new-workspace":
 elif command == "workspace-action":
     print("OK color-set")
     sys.exit(config.get("color_exit", 0))
+elif command == "workspace-group":
+    window = args[args.index("--window") + 1] if "--window" in args else config.get("current_window")
+    if args[1] == "list":
+        if window in config.get("group_fail_windows", []):
+            sys.exit(1)
+        if "group_list_output" in config:
+            print(config["group_list_output"])
+        else:
+            print(json.dumps({"groups": config.get("groups", {}).get(window, []), "window_id": window}))
+    elif args[1] == "add":
+        print("OK added")
+        sys.exit(config.get("group_add_exit", 0))
+    elif args[1] == "create":
+        if config.get("group_create_exit", 0):
+            sys.exit(config["group_create_exit"])
+        group = {"id": config.get("created_group_id", "33333333-3333-4333-8333-333333333333"),
+                 "name": args[args.index("--name") + 1]}
+        config.setdefault("groups", {}).setdefault(window, []).append(group)
+        (root / "fake.json").write_text(json.dumps(config))
+        print(config.get("group_create_output", json.dumps({"group": group, "window_id": window})))
+    else:
+        sys.exit(2)
 else:
     sys.exit(2)
 '''
@@ -105,6 +133,21 @@ class CompatibilityTests(unittest.TestCase):
         path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
         return path
 
+    def session(self, groups, at=1778307400, previous=False):
+        path = Path(self.manager.SESSIONS[0 if previous else 1])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"createdAt": at, "windows": [
+            {"tabManager": {"workspaceGroups": groups}}]}))
+        return path
+
+    def configure_groups(self, **values):
+        defaults = {"methods": GROUP_METHODS + ["surface.resume.set", "surface.resume.get"],
+                    "windows": [{"id": WINDOW_A}], "current_window": WINDOW_A}
+        self.configure(**dict(defaults, **values))
+
+    def group_mutations(self):
+        return [c for c in self.calls() if c[0] == "workspace-group" and c[1] != "list"]
+
     def calls(self):
         path = self.home / "calls.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
@@ -123,6 +166,7 @@ class CompatibilityTests(unittest.TestCase):
             self.assertEqual(result.stderr, "")
         self.assertEqual(self.calls(), [])
         self.assertFalse(Path(self.manager.HISTORY).exists())
+        self.assertFalse(Path(self.manager.GROUPS).exists())
 
     def test_unknown_option_is_a_usage_error(self):
         result = self.run_cli("--unknown")
@@ -434,6 +478,341 @@ class CompatibilityTests(unittest.TestCase):
                     self.manager.subprocess, "run", side_effect=error), contextlib.redirect_stderr(io.StringIO()) as output:
                 self.assertEqual(self.manager.do_reopen(item, plain=True), 1)
                 self.assertTrue(output.getvalue())
+
+    def test_session_group_names_are_cached_and_survive_deletion(self):
+        native = self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        previous = self.session([{"id": GROUP_A, "name": "Old name"}], at=1778307300, previous=True)
+        current = self.session([{"id": GROUP_A, "name": "Infra"}], at=1778307400)
+        original = [p.read_bytes() for p in (native, previous, current)]
+        self.assertEqual(self.manager.entries()[0]["group_name"], "Infra")
+        cache = json.loads(Path(self.manager.GROUPS).read_text())
+        self.assertEqual(cache["groups"][GROUP_A]["name"], "Infra")
+        self.assertEqual(set(cache), {"version", "groups", "aliases"})
+        self.assertEqual(set(cache["groups"][GROUP_A]), {"name", "ts"})
+        self.assertEqual([p.read_bytes() for p in (native, previous, current)], original)
+        previous.unlink()
+        current.unlink()
+        self.assertEqual(self.manager.entries()[0]["group_name"], "Infra")
+
+    def test_window_group_name_stays_historical_and_live_name_resolves_individual_close(self):
+        self.configure_groups(groups={WINDOW_A: [{"id": GROUP_A, "name": "Current name"}]})
+        window = {"closedAt": 800000000, "entry": {"window": {"snapshot": {"tabManager": {
+            "workspaces": [dict(snapshot("from-window", "/tmp/window"), groupId=GROUP_A)],
+            "workspaceGroups": [None, {"id": GROUP_A, "name": "Saved name"}]}}}}}
+        self.native([window, closed(dict(snapshot("individual"), groupId=GROUP_A), 800000100)], legacy=True)
+        self.session([{"id": GROUP_A, "name": "Session name"}])
+        items = {it["id"]: it for it in self.manager.entries()}
+        self.assertEqual(items["from-window"]["group_name"], "Saved name")
+        self.assertEqual(items["individual"]["group_name"], "Current name")
+
+    def test_newest_closed_window_catalog_resolves_other_snapshots(self):
+        records = [closed(dict(snapshot(), groupId=GROUP_A))]
+        for name, at in (("Newer", 800000200), ("Older", 800000100)):
+            records.append({"closedAt": at, "entry": {"window": {"_0": {"snapshot": {
+                "tabManager": {"workspaceGroups": [{"id": GROUP_A, "name": name}]}}}}}})
+        self.native(records)
+        self.session([{"id": GROUP_A, "name": "Earlier session"}], at=1778307250)
+        self.assertEqual(self.manager.entries()[0]["group_name"], "Newer")
+
+    def test_group_labels_are_sanitized_in_listing_and_picker_and_searchable(self):
+        name = "Infra\ttools\n\x1b[31m\u202e"
+        self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        self.session([{"id": GROUP_A, "name": name}])
+        items = self.manager.entries()
+        self.assertEqual(self.manager.visible({"items": items, "q": "INFRA"}), items)
+        result = self.run_cli("--no-interactive")
+        self.assertIn("group: Infra", result.stdout)
+        for control in ("\t", "\x1b", "\u202e"):
+            self.assertNotIn(control, result.stdout)
+        self.assertEqual(len([line for line in result.stdout.splitlines() if line.strip().startswith("1 ")]), 1)
+        state = {"attr": {k: 0 for k in ("sel", "num", "time", "title", "path", "badge")},
+                 "ascii": False, "ell": "…", "home": str(self.home), "mark": ">",
+                 "dot": "·", "show_all": False}
+        with mock.patch.object(self.manager, "put") as put:
+            self.manager.draw_row(None, state, 0, 1, items[0], False, 180)
+        metadata = put.call_args_list[-1].args[3]
+        self.assertIn("group: Infra", metadata)
+        for control in ("\t", "\n", "\x1b", "\u202e"):
+            self.assertNotIn(control, metadata)
+
+    def test_existing_group_targets_its_window_and_exact_created_handle(self):
+        for handle in ("workspace:99", "01234567-89ab-cdef-0123-456789abcdef"):
+            with self.subTest(handle=handle):
+                self.configure_groups(windows=[{"id": WINDOW_A}, {"id": WINDOW_B}],
+                                      groups={WINDOW_B: [{"id": GROUP_A, "name": "Infra"}]},
+                                      create_output="OK " + handle + "\n")
+                self.native([closed(dict(snapshot(), groupId=GROUP_A, customColor="#ABCDEF"))])
+                before = len(self.calls())
+                result = self.run_cli("reopen", "1")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                calls = self.calls()[before:]
+                creation = [c for c in calls if c[0] == "new-workspace"]
+                self.assertEqual(len(creation), 1)
+                self.assertEqual(creation[0][creation[0].index("--window") + 1], WINDOW_B)
+                self.assertEqual(calls[-1], ["workspace-group", "add", "--group", GROUP_A,
+                                             "--workspace", handle, "--window", WINDOW_B])
+                self.assertIn(["workspace-action", "--workspace", handle, "--action", "set-color",
+                               "--color", "#ABCDEF"], calls)
+
+    def test_group_refresh_follows_moves_since_listing(self):
+        self.configure_groups(groups={WINDOW_A: [{"id": GROUP_A, "name": "Infra"}]})
+        self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        item = self.manager.entries()[0]
+        self.configure_groups(windows={"windows": [{"ref": "window:2"}]},
+                              groups={"window:2": [{"id": GROUP_A, "name": "Infra"}]})
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(self.manager.do_reopen(item), 0)
+        self.assertEqual(error.getvalue(), "")
+        self.assertEqual(self.group_mutations()[-1][-2:], ["--window", "window:2"])
+
+    def test_missing_group_is_recreated_and_reused_on_subsequent_reopen(self):
+        self.configure_groups()
+        path = self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        original = path.read_bytes()
+        self.session([{"id": GROUP_A, "name": "Infra"}])
+        first = self.run_cli("reopen", "1")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(first.stderr, "")
+        creation = [c for c in self.calls() if c[0] == "new-workspace"]
+        self.assertEqual(len(creation), 1)
+        self.assertNotIn("--window", creation[0])
+        self.assertEqual(self.group_mutations(), [["workspace-group", "create", "--name", "Infra",
+            "--from", "workspace:99", "--cwd", "/tmp/project", "--json", "--id-format", "uuids"]])
+        catalog = json.loads(Path(self.manager.GROUPS).read_text())
+        self.assertEqual(catalog["aliases"][GROUP_A], GROUP_C)
+        second = self.run_cli("reopen", "1")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.stderr, "")
+        self.assertEqual(self.group_mutations()[-1], ["workspace-group", "add", "--group", GROUP_C,
+            "--workspace", "workspace:99", "--window", WINDOW_A])
+        self.assertEqual(sum(c[1] == "create" for c in self.group_mutations()), 1)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_equal_group_names_are_not_identity_and_names_are_argv_values(self):
+        marker = self.home / "unexpected"
+        name = "Infra 'tools' $(touch " + shlex.quote(str(marker)) + ")"
+        self.configure_groups(groups={WINDOW_A: [{"id": GROUP_B, "name": name}]})
+        self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        self.session([{"id": GROUP_A, "name": name}])
+        result = self.run_cli("reopen", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mutation = self.group_mutations()[0]
+        self.assertEqual(mutation[1], "create")
+        self.assertEqual(mutation[mutation.index("--name") + 1], name)
+        self.assertFalse(marker.exists())
+
+    def test_unknown_group_name_warns_and_invalid_membership_is_skipped(self):
+        self.configure_groups()
+        self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        self.assertIn("group unknown", self.run_cli("--no-interactive").stdout)
+        result = self.run_cli("reopen", "1")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("saved group could not be restored", result.stderr)
+        self.assertEqual(self.group_mutations(), [])
+        for group_id in (None, "", [], {}, 123, "--help", "workspace_group:1", GROUP_A + "\0"):
+            with self.subTest(group_id=group_id):
+                self.native([closed(dict(snapshot(), groupId=group_id))])
+                result = self.run_cli("reopen", "1")
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, "")
+        self.assertEqual(self.group_mutations(), [])
+
+    def test_plain_skips_group_membership_and_window_routing(self):
+        self.configure_groups(windows=[{"id": WINDOW_B}],
+                              groups={WINDOW_B: [{"id": GROUP_A, "name": "Infra"}]})
+        self.native([closed(dict(snapshot(), groupId=GROUP_A, customColor="#ABCDEF"))])
+        result = self.run_cli("reopen", "1", "--plain")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "OK workspace:99\n")
+        self.assertEqual(self.calls()[-1], ["new-workspace", "--name", "Project", "--cwd", "/tmp/project"])
+        self.assertEqual(self.group_mutations(), [])
+
+    def test_grafted_agent_and_all_numbering_keep_selected_snapshot_group(self):
+        self.configure_groups(groups={WINDOW_A: [
+            {"id": GROUP_A, "name": "Old group"}, {"id": GROUP_B, "name": "New group"}]})
+        self.native([closed(dict(snapshot("older", agent="claude"), groupId=GROUP_A)),
+                     closed(dict(snapshot("newer"), groupId=GROUP_B), 800000100)])
+        result = self.run_cli("--all", "reopen", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("AI session came from an earlier close", result.stdout)
+        self.assertEqual(self.group_mutations()[-1][3], GROUP_B)
+
+    def test_unusable_layout_still_restores_group(self):
+        self.configure_groups(groups={WINDOW_A: [{"id": GROUP_A, "name": "Infra"}]})
+        self.native([closed(dict(snapshot(), groupId=GROUP_A, layout=None))])
+        result = self.run_cli("reopen", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("No usable snapshot", result.stdout)
+        self.assertEqual(self.group_mutations()[-1][1], "add")
+
+    def test_failed_creation_and_unexpected_output_never_mutate_groups(self):
+        self.configure_groups(create_exit=7)
+        self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        self.session([{"id": GROUP_A, "name": "Infra"}])
+        self.assertEqual(self.run_cli("reopen", "1").returncode, 7)
+        for output in ("", "OK", "OK current\n", "OK surface:99\n", "OK --help\n",
+                       "OK workspace:99\nOK workspace:100\n"):
+            with self.subTest(output=output):
+                self.configure_groups(create_output=output)
+                result = self.run_cli("reopen", "1")
+                self.assertEqual(result.returncode, 0)
+                self.assertIn("saved group could not be restored", result.stderr)
+        self.assertEqual(self.group_mutations(), [])
+
+    def test_group_mutation_failures_keep_reopen_success(self):
+        self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        self.session([{"id": GROUP_A, "name": "Infra"}])
+        for subcommand in ("add", "create"):
+            with self.subTest(subcommand=subcommand):
+                groups = {WINDOW_A: [{"id": GROUP_A, "name": "Infra"}]} if subcommand == "add" else {}
+                self.configure_groups(groups=groups, **{"group_" + subcommand + "_exit": 7})
+                result = self.run_cli("reopen", "1")
+                self.assertEqual(result.returncode, 0)
+                self.assertIn("Restored 1 terminal", result.stdout)
+                self.assertIn("saved group could not be restored", result.stderr)
+        self.assertEqual(sum(c[0] == "new-workspace" for c in self.calls()), 2)
+        self.assertFalse(any(c[0].startswith("close-") for c in self.calls()))
+
+    def test_incomplete_inventory_does_not_recreate_but_known_groups_remain_usable(self):
+        self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        self.session([{"id": GROUP_A, "name": "Infra"}])
+        self.configure_groups(windows=[{"id": WINDOW_A}, {"id": WINDOW_B}],
+                              group_fail_windows=[WINDOW_A],
+                              groups={WINDOW_B: [{"id": GROUP_A, "name": "Infra"}]})
+        self.assertEqual(self.run_cli("reopen", "1").stderr, "")
+        before = len(self.group_mutations())
+        cases = ({"group_fail_windows": [WINDOW_A]}, {"windows": [None]},
+                 {"group_list_output": "not JSON"}, {"group_list_output": '{"groups": {}}'},
+                 {"groups": {WINDOW_A: [None, {"id": "--help"}]}},
+                 {"groups": {WINDOW_A: [{"id": GROUP_A}, {"id": GROUP_A}]}})
+        for values in cases:
+            with self.subTest(values=values):
+                self.configure_groups(**values)
+                result = self.run_cli("reopen", "1")
+                self.assertEqual(result.returncode, 0)
+                self.assertIn("saved group could not be restored", result.stderr)
+        self.assertEqual(len(self.group_mutations()), before)
+
+    def test_older_cmux_displays_saved_group_and_warns_on_restore(self):
+        self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        self.session([{"id": GROUP_A, "name": "Infra"}])
+        self.assertIn("group: Infra", self.run_cli("--no-interactive").stdout)
+        result = self.run_cli("reopen", "1")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("saved group could not be restored", result.stderr)
+        self.assertFalse(any(c[0] == "workspace-group" for c in self.calls()))
+
+    def test_group_calls_have_finite_timeouts_and_fail_without_rollback(self):
+        self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        self.session([{"id": GROUP_A, "name": "Infra"}])
+        original_run = self.manager.subprocess.run
+        for subcommand in ("list", "add", "create"):
+            for failure in (FileNotFoundError(), subprocess.TimeoutExpired("cmux", 5)):
+                with self.subTest(subcommand=subcommand, failure=type(failure).__name__):
+                    groups = {WINDOW_A: [{"id": GROUP_A, "name": "Infra"}]} if subcommand == "add" else {}
+                    self.configure_groups(groups=groups)
+                    observed = []
+                    def run(args, **kwargs):
+                        if args[:3] == ["cmux", "workspace-group", subcommand]:
+                            observed.append(kwargs["timeout"])
+                            raise failure
+                        return original_run(args, **kwargs)
+                    with mock.patch.object(self.manager.subprocess, "run", side_effect=run), \
+                            contextlib.redirect_stdout(io.StringIO()), \
+                            contextlib.redirect_stderr(io.StringIO()) as error:
+                        self.assertEqual(self.manager.do_reopen(self.manager.entries()[0]), 0)
+                    self.assertTrue(observed)
+                    self.assertEqual(set(observed), {5})
+                    self.assertIn("saved group could not be restored", error.getvalue())
+        self.assertFalse(any(c[0].startswith("close-") for c in self.calls()))
+
+    def test_group_creation_timeout_never_attempts_followup_mutation(self):
+        self.configure_groups()
+        self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        self.session([{"id": GROUP_A, "name": "Infra"}])
+        item = self.manager.entries()[0]
+        original_run = self.manager.subprocess.run
+        def run(args, **kwargs):
+            if args[:2] == ["cmux", "new-workspace"]:
+                raise subprocess.TimeoutExpired("cmux", 30, output=b"OK workspace:99\n")
+            return original_run(args, **kwargs)
+        with mock.patch.object(self.manager.subprocess, "run", side_effect=run), \
+                contextlib.redirect_stdout(io.StringIO()) as output, \
+                contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(self.manager.do_reopen(item), 1)
+        self.assertEqual(output.getvalue(), "OK workspace:99\n")
+        self.assertIn("30 seconds", error.getvalue())
+        self.assertEqual(self.group_mutations(), [])
+
+    def test_malformed_group_cache_and_sessions_do_not_break_listing(self):
+        self.configure_groups()
+        self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        cache = Path(self.manager.GROUPS)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        for data in ("bad JSON", "[]", '{"version":1,"groups":[],"aliases":[]}',
+                     json.dumps({"version": 1, "groups": {GROUP_A: {"name": [], "ts": "bad"}},
+                                 "aliases": {GROUP_A: GROUP_B, GROUP_B: GROUP_A, "bad": []}})):
+            with self.subTest(data=data):
+                cache.write_text(data)
+                path = self.session([None, {"id": "--help", "name": "Invalid"},
+                                     {"id": GROUP_A, "name": []}])
+                self.assertEqual(self.manager.entries()[0]["group_name"], "")
+                path.write_text('{"windows": [{"tabManager": null}, null], "createdAt": []}')
+                self.assertEqual(self.manager.entries()[0]["group_name"], "")
+        future = '{"version": 2, "groups": {}}'
+        cache.write_text(future)
+        self.session([{"id": GROUP_A, "name": "Infra"}])
+        self.assertEqual(self.manager.entries()[0]["group_name"], "Infra")
+        self.assertEqual(cache.read_text(), future)
+
+    def test_catalog_write_failure_keeps_recreated_group_and_workspace(self):
+        self.configure_groups()
+        self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        self.session([{"id": GROUP_A, "name": "Infra"}])
+        with mock.patch.object(self.manager.os, "replace", side_effect=OSError()), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as error:
+            item = self.manager.entries()[0]
+            self.assertEqual(item["group_name"], "Infra")
+            self.assertEqual(self.manager.do_reopen(item), 0)
+        self.assertIn("local group mapping could not be saved", error.getvalue())
+        self.assertNotIn("saved group could not be restored", error.getvalue())
+        self.assertEqual(len(self.group_mutations()), 1)
+        self.assertFalse(list(Path(self.manager.LOG_DIR).glob(".workspace-groups-*")))
+
+    def test_malformed_group_creation_response_never_records_an_alias(self):
+        self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        self.session([{"id": GROUP_A, "name": "Infra"}])
+        for response in ("not JSON", "[]", '{"group": null}', '{"group": {"id": "--help"}}',
+                         '{"group": {"id": []}}'):
+            with self.subTest(response=response):
+                self.configure_groups(group_create_output=response)
+                result = self.run_cli("reopen", "1")
+                self.assertEqual(result.returncode, 0)
+                self.assertIn("saved group could not be restored", result.stderr)
+                self.assertEqual(json.loads(Path(self.manager.GROUPS).read_text())["aliases"], {})
+        self.assertFalse(any(c[0].startswith("close-") for c in self.calls()))
+
+    def test_saved_original_group_wins_over_recreated_mapping(self):
+        self.configure_groups(groups={WINDOW_A: [
+            {"id": GROUP_A, "name": "Original"}, {"id": GROUP_C, "name": "Recreated"}]})
+        self.native([closed(dict(snapshot(), groupId=GROUP_A))])
+        cache = Path(self.manager.GROUPS)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({"version": 1, "groups": {}, "aliases": {GROUP_A: GROUP_C}}))
+        result = self.run_cli("reopen", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.group_mutations()[-1][3], GROUP_A)
+
+    def test_event_only_close_does_not_infer_membership_from_name_or_directory(self):
+        self.configure_groups(groups={WINDOW_A: [{"id": GROUP_A, "name": "Project"}]})
+        self.events([{"category": "workspace", "id": "event", "workspace_id": "closed",
+                      "name": "workspace.closed", "payload": {"cwd": "/tmp/project", "title": "Project"}}])
+        self.assertNotIn("group:", self.run_cli("--no-interactive").stdout)
+        result = self.run_cli("reopen", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(self.group_mutations(), [])
 
 
 if __name__ == "__main__":
