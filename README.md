@@ -18,7 +18,7 @@ Run it with no arguments and you get an interactive picker:
                                               1T
     3  Aug 19 01:24   code                    ~/code
                                               3T  1AI*
- ↑↓ move  ⏎ reopen  / search  r refresh  ? keys  q / esc quit
+ ↑↓ move  ⏎ reopen  d delete  s settings  / search  r refresh  ? keys  q / esc quit
 ```
 
 Arrow to a workspace, press enter, and it comes back. Each entry's second line
@@ -42,8 +42,10 @@ those entries; the command-line `reopen <n> --plain` opens only a local shell.
 | `↑` `↓` / `k` `j` | move |
 | `PgUp` `PgDn` / `Home` `End` / `g` `G` | page, first, last |
 | `enter` | reopen with the saved layout, then exit |
+| `d` | remove the selected workspace's existing close history from this tool; type `YES` and press `enter` to confirm |
 | `/` | filter by title, path, or group; `enter` keeps it, `esc` clears it |
 | `r` | reload |
+| `s` | open settings differences |
 | `?` | key help |
 | `q` / `esc` | quit without doing anything; `esc` clears an active filter first |
 
@@ -77,6 +79,96 @@ It also skips restoring the saved workspace color and group membership.
 Run `cmux-ws-manager --help` for the full option list. An unrecognized option
 is a usage error, not a silent no-op.
 
+## Delete closed entries
+
+Press `d` on a workspace to open an **Are you sure?** dialog showing its title
+and directory. Type exactly `YES` and press `enter` to remove it. Lowercase,
+extra spaces, or an empty confirmation are rejected. Backspace edits the input;
+Ctrl+U clears it; `esc` or Ctrl+C cancels. The picker stays open after deletion
+and preserves your search.
+
+From the command line:
+
+```sh
+cmux-ws-manager delete 2
+```
+
+The command displays the workspace and requires the same `YES` confirmation.
+Ctrl+C or EOF cancels. Both stdin and stdout must be terminals; piped confirmation
+is rejected. There is no confirmation bypass flag. `--plain` and
+`--no-interactive` are invalid with `delete`.
+
+Deletion removes **all existing closes of that workspace** from this tool's
+picker and plain listings, including `--all`, so an older close does not replace
+the deleted row. Workspaces with different custom titles on the same directory
+remain distinct. `delete <n>` uses the default filtered numbering, just like
+`reopen <n>`, even when `--all` is supplied. In the `--all` picker, `d` still
+removes all existing closes of the selected workspace.
+
+Removals are remembered in `~/.cmuxterm/workspace-deletions.json`, which stores
+workspace identities, IDs, and close-time cutoffs, without snapshots or session
+payloads. cmux's native History and the source logs are preserved; this removes
+entries only from this tool. A later close of the same workspace can appear
+again, without inheriting AI sessions from its deleted snapshots. If saving a
+removal fails, an error is shown and the selected entry remains available.
+
+## Settings differences
+
+Press `s` in the workspace picker to see local cmux settings that differ from
+their factory defaults. The screen shows **Setting**, **Current**, and
+**Default**, with each value's source below its row. Arrow keys or `j`/`k`
+navigate; `/` searches settings, values, and sources; `r` refreshes; and
+`enter` opens the full values in a scrollable details screen. `i` shows the
+cmux version, comparison coverage, and any notices. `?` shows the keys.
+
+`esc` leaves details, cancels search or clears a filter, then returns to the
+workspace picker. Returning preserves its selection, search, and scroll
+position. `q` quits from either screen. Refreshing settings does not reload
+workspace history or reopen a workspace.
+
+For a plain report:
+
+```sh
+cmux-ws-manager settings diff
+```
+
+It prints **Setting | Current | Default | Source**, without launching the
+picker. This command never reads or harvests workspace history. The report is
+read-only: it does not change cmux configuration, macOS preferences, or saved
+workspace data, and it does not require a running cmux window.
+
+The report reads `~/.config/cmux/cmux.json` as JSONC, with per-setting fallbacks
+from `~/.config/cmux/settings.json` and
+`~/Library/Application Support/com.cmuxterm.app/settings.json`, plus saved
+macOS preferences. For ordinary preferences, a saved choice in cmux's Settings
+window takes precedence over an imported file value. File-managed shortcut
+bindings take precedence over saved shortcut preferences. Values are normalized
+to their public setting representation; an explicit value equal to its default
+is omitted. Shortcut defaults are compared per action, and `(unbound)` means an
+explicitly disabled binding.
+
+The embedded defaults and preference mappings are verified against **cmux
+0.64.25, commit `b685a275c`**. Runtime defaults are used when schema annotations
+disagree. The command performs no network requests and adds no runtime
+dependencies. Other versions or builds show configured values with
+`(unverified)` defaults. Right-sidebar positional shortcut defaults and explicit
+shortcut `when` clauses depend on context; configured overrides are also marked
+unverified. Keyboard shortcut comparisons describe saved bindings, without
+evaluating keyboard-layout or system shortcut conflicts.
+
+Exit status is `0` for a complete report, whether or not differences exist,
+and non-zero for invalid arguments or incomplete comparisons. Missing settings
+files are normal. Malformed files or values, unsupported settings, unavailable
+preferences, and unverified defaults produce concise notices; readable settings
+remain available. A saved plist can supply values when live preference export
+fails, but those comparisons are marked unverified. “No differences” always
+states how many settings were verified.
+
+The comparison covers recognized local cmux app settings and configured keyboard
+shortcuts. Ghostty font, theme, and terminal configuration, managed device
+policies, environment overrides, custom actions, commands, layouts, vault data,
+and credentials are outside this report.
+
 ## What you see
 
 The default view shows one row per reopenable workspace. A closed workspace is
@@ -97,9 +189,9 @@ comes back as a row — its directory is occupied by a name that no longer
 matches. Those rows carry a `dir open` badge, so it is visible that reopening
 adds a second workspace on that path.
 
-`cmux-ws-manager --all` shows the raw close history instead — in the picker it
-replaces the row numbers with `·`, because `reopen <n>` numbering always
-follows the default view.
+`cmux-ws-manager --all` shows the raw close history, with deleted entries omitted.
+In the picker it replaces the row numbers with `·`, because `reopen <n>` and
+`delete <n>` numbering always follows the default view.
 
 `reopen <n>` rebuilds the workspace from cmux's snapshot: split layout,
 terminals starting at their original directories, custom pane names, supported

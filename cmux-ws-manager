@@ -34,8 +34,9 @@ With no command this runs an interactive curses browser; it falls back to
 the plain listing whenever a terminal is not available or --no-interactive
 is given, so scripts and agents always get parseable text.
 """
-import json, locale, math, os, re, shlex, subprocess, sys, tempfile, unicodedata
+import fcntl, json, locale, math, os, plistlib, re, shlex, shutil, subprocess, sys, tempfile, unicodedata
 from datetime import datetime
+from xml.parsers.expat import ExpatError
 try:
     import curses  # importing is side-effect free; nothing touches the tty
 except ImportError:  # until initscr, so --help stays unaffected
@@ -49,19 +50,414 @@ NATIVE = os.path.expanduser(
 SESSIONS = [os.path.join(os.path.dirname(NATIVE), name) for name in
             ("session-com.cmuxterm.app-previous.json", "session-com.cmuxterm.app.json")]
 GROUPS = os.path.join(LOG_DIR, "workspace-groups.json")
+DELETIONS = os.path.join(LOG_DIR, "workspace-deletions.json")
 UUID_PATTERN = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
 APPLE_EPOCH = 978307200  # 2001-01-01 UTC, the reference for closedAt
 AGENT_RESUME = {"claude": ["claude", "--resume"], "codex": ["codex", "resume"],
                 "opencode": ["opencode", "--session"]}
 GRAFT_WINDOW = 7 * 86400  # maximum age of a carried-over session
 
+# Factory values and preference mappings verified against cmux 0.64.25,
+# commit b685a275c (CmuxSettings catalog, settings parsers, shortcut actions).
+# Runtime defaults take precedence over stale schema annotations.
+SETTINGS_VERSION = "0.64.25"
+SETTINGS_COMMIT = "b685a275c"
+SETTINGS_DEFAULTS = {
+    'activePaneBorderColor': (None, 'activePaneBorderColor', 'color'),
+    'paneBorderColor': (None, 'paneBorderColor', 'color'),
+    'app.appIcon': ('automatic', 'appIconMode', ''),
+    'app.appearance': ('system', 'appearanceMode', ''),
+    'app.commandPaletteSearchesAllSurfaces': (False, 'commandPalette.switcherSearchAllSurfaces', ''),
+    'app.confirmQuit': ('always', 'confirmQuit', ''),
+    'app.fileDropDefaultBehavior': ('text', 'fileDrop.defaultBehavior', ''),
+    'app.focusHistoryIncludesPanesAndTabs': (False, 'focusHistoryIncludesPanesAndTabs', ''),
+    'app.focusPaneOnFirstClick': (False, 'paneFirstClickFocus.enabled', ''),
+    'app.forkConversationDefaultDestination': ('right', 'agentConversationForkDefaultDestination', ''),
+    'app.globalFontMagnification': (100, 'globalFontMagnificationPercent', ''),
+    'app.hideTabCloseButton': (False, 'hideTabCloseButton', ''),
+    'app.iMessageMode': (False, 'app.iMessageMode', ''),
+    'app.keepWorkspaceOpenWhenClosingLastSurface': (False, 'closeWorkspaceOnLastSurfaceShortcut', 'inverse'),
+    'app.language': ('system', 'appLanguage', ''),
+    'app.menuBarOnly': (False, 'menuBarOnly', ''),
+    'app.minimalMode': (False, 'workspacePresentationMode', 'minimal'),
+    'app.newWorkspacePlacement': ('afterCurrent', 'newWorkspacePlacement', ''),
+    'app.openMarkdownInCmuxViewer': (True, 'openMarkdownInCmuxViewer', ''),
+    'app.openSupportedFilesInCmux': (True, 'openSupportedFilesInCmux', ''),
+    'app.paneResizeStepPixels': (20, 'paneResizeStepPixels', ''),
+    'app.preferredEditor': ('', 'preferredEditorCommand', ''),
+    'app.renameSelectsExistingName': (True, 'commandPalette.renameSelectAllOnFocus', ''),
+    'app.reorderOnNotification': (True, 'workspaceAutoReorderOnNotification', ''),
+    'app.sendAnonymousTelemetry': (True, 'sendAnonymousTelemetry', ''),
+    'app.systemWideHotkeyEnabled': (False, 'systemWideHotkey.enabled', ''),
+    'app.titlebarControlsStyle': (0, 'titlebarControlsStyle', ''),
+    'app.warnBeforeClosingTab': (True, 'warnBeforeClosingTabShortcut', ''),
+    'app.warnBeforeClosingTabXButton': (False, 'warnBeforeClosingTabXButton', ''),
+    'app.warnBeforeQuit': (True, 'warnBeforeQuitShortcut', ''),
+    'app.windowTitleTemplate': ('', 'windowTitleTemplate', ''),
+    'app.workspaceButtonFade': ('disabled', 'workspaceButtonsFadeMode', ''),
+    'app.workspaceInheritWorkingDirectory': (True, 'workspaceInheritWorkingDirectory', ''),
+    'app.workspaceTitlebarVisibility': (True, 'workspaceTitlebarVisible', ''),
+    'automation.ampIntegration': (True, 'ampHooksEnabled', ''),
+    'automation.autoNamingAgent': ('auto', 'autoNamingAgent', ''),
+    'automation.claudeBinaryPath': ('', 'claudeCodeCustomClaudePath', ''),
+    'automation.claudeCodeIntegration': (True, 'claudeCodeHooksEnabled', ''),
+    'automation.cursorIntegration': (True, 'cursorHooksEnabled', ''),
+    'automation.geminiIntegration': (True, 'geminiHooksEnabled', ''),
+    'automation.kiroIntegration': (True, 'kiroHooksEnabled', ''),
+    'automation.kiroNotificationLevel': ('standard', 'kiroNotificationLevel', ''),
+    'automation.portBase': (9100, 'cmuxPortBase', ''),
+    'automation.portRange': (10, 'cmuxPortRange', ''),
+    'automation.ripgrepBinaryPath': ('', 'ripgrepCustomBinaryPath', ''),
+    'automation.socketControlMode': ('cmuxOnly', 'socketControlMode', 'socket'),
+    'automation.suppressSubagentNotifications': (True, 'suppressSubagentNotifications', ''),
+    'automation.workspaceAutoNaming': (False, 'workspaceAutoNamingEnabled', ''),
+    'browser.askWhereToSaveDownloads': (False, 'browserAskWhereToSaveDownloads', ''),
+    'browser.customSearchEngineName': ('', 'browserCustomSearchEngineName', ''),
+    'browser.customSearchEngineURLTemplate': ('https://www.google.com/search?q={query}', 'browserCustomSearchEngineURLTemplate', ''),
+    'browser.defaultSearchEngine': ('google', 'browserSearchEngine', ''),
+    'browser.defaultZoomLevel': (1.0, 'browserDefaultZoomLevel', ''),
+    'browser.disabled': (False, 'browserDisabledOverride', ''),
+    'browser.discardHiddenWebViews': (True, 'browserHiddenWebViewDiscardEnabled', ''),
+    'browser.hiddenWebViewDiscardDelaySeconds': (300, 'browserHiddenWebViewDiscardDelaySeconds', ''),
+    'browser.hostsToOpenInEmbeddedBrowser': ([], 'browserHostWhitelist', 'lines'),
+    'browser.insecureHttpHostsAllowedInEmbeddedBrowser': (['localhost', '*.localhost', '127.0.0.1', '::1', '0.0.0.0', '*.localtest.me'], 'browserInsecureHTTPAllowlist', 'lines'),
+    'browser.interceptTerminalOpenCommandInCmuxBrowser': (True, 'browserInterceptTerminalOpenCommandInCmuxBrowser', ''),
+    'browser.openTerminalLinksInCmuxBrowser': (True, 'browserOpenTerminalLinksInCmuxBrowser', ''),
+    'browser.reactGrabVersion': ('0.1.29', 'reactGrabVersion', ''),
+    'browser.showImportHintOnBlankTabs': (True, 'browserImportHintShowOnBlankTabs', ''),
+    'browser.showSearchSuggestions': (True, 'browserSearchSuggestionsEnabled', ''),
+    'browser.theme': ('system', 'browserThemeMode', ''),
+    'browser.urlAllowlist': (['localhost', '*.localhost', '127.0.0.1', '::1', '0.0.0.0', '*.localtest.me'], 'browserURLAllowlist', 'lines'),
+    'browser.urlsToAlwaysOpenExternally': ([], 'browserExternalOpenPatterns', 'lines'),
+    'canvas.paneGap': (16, 'canvasPaneGap', ''),
+    'canvas.snappingEnabled': (True, 'canvasSnappingEnabled', ''),
+    'computerUse.enabled': (True, None, ''),
+    'computerUse.showInMenuBar': (True, None, ''),
+    'diffViewer.defaultLayout': ('unified', None, ''),
+    'fileEditor.currentLineHighlight': (True, 'fileEditor.currentLineHighlight', ''),
+    'fileEditor.indentGuides': (True, 'fileEditor.indentGuides', ''),
+    'fileEditor.lineNumbers': (True, 'fileEditor.lineNumbers', ''),
+    'fileEditor.syntaxHighlighting': (True, 'fileEditor.syntaxHighlighting', ''),
+    'fileEditor.tabWidth': (4, 'fileEditor.tabWidth', ''),
+    'fileEditor.wordWrap': (False, 'fileEditor.wordWrap', ''),
+    'fileExplorer.doubleClickAction': ('preview', 'fileExplorerDoubleClickAction', ''),
+    'markdown.fontFamily': ('', 'markdown.fontFamily', ''),
+    'markdown.fontSize': (15, 'markdown.fontSize', ''),
+    'markdown.maxWidth': (980, 'markdown.maxWidth', ''),
+    'mobile.artifactFolderAccess': ('subtree', 'mobile.artifactFolderAccess', ''),
+    'mobile.iOSPairingHost.displayName': ('', 'mobile.iOSPairingHost.displayName', ''),
+    'mobile.iOSPairingHost.enabled': (False, 'mobile.iOSPairingHost.enabled', ''),
+    'mobile.iOSPairingHost.port': (58465, 'mobile.iOSPairingHost.port', ''),
+    'mobile.phonePush.forwardingEnabled': (True, 'forwardNotificationsToPhone', ''),
+    'mobile.phonePush.hideContent': (False, 'forwardNotificationsHideContent', ''),
+    'mobile.phonePush.mode': ('always', 'forwardNotificationsToPhoneMode', ''),
+    'notifications.agentIdleReminder': (True, 'notificationAgentIdleReminderEnabled', ''),
+    'notifications.agentPermissionPrompt': (True, 'notificationAgentPermissionPromptEnabled', ''),
+    'notifications.agentTurnComplete': ('whenIdle', 'notificationAgentTurnComplete', ''),
+    'notifications.command': ('', 'notificationCustomCommand', ''),
+    'notifications.customSoundFilePath': ('', 'notificationSoundCustomFilePath', ''),
+    'notifications.dockBadge': (True, 'notificationDockBadgeEnabled', ''),
+    'notifications.hooks': ([], None, ''),
+    'notifications.hooksMode': ('append', None, ''),
+    'notifications.paneFlash': (True, 'notificationPaneFlashEnabled', ''),
+    'notifications.paneFlashColor': (None, 'notificationPaneFlashColorHex', 'color'),
+    'notifications.showInMenuBar': (True, 'showMenuBarExtra', ''),
+    'notifications.sound': ('default', 'notificationSound', ''),
+    'notifications.soundOverrides': ({}, 'notificationSoundOverrides', 'json'),
+    'notifications.suppressOnlyFocusedSurface': (False, 'notificationsSuppressOnlyFocusedSurface', ''),
+    'notifications.unreadPaneRing': (True, 'notificationPaneRingEnabled', ''),
+    'shortcuts.showModifierHoldHints': (True, 'showModifierHoldHints', ''),
+    'sidebar.beta.workspaceTodos.checklistStyle': ('popover', 'sidebarWorkspaceTodosChecklistStyle', ''),
+    'sidebar.beta.workspaceTodos.controls.enabled': (False, 'sidebar.beta.workspaceTodos.controls.enabled', ''),
+    'sidebar.branchLayout': ('vertical', 'sidebarBranchVerticalLayout', 'branch'),
+    'sidebar.hideAllDetails': (False, 'sidebarHideAllDetails', ''),
+    'sidebar.loadingSpinnerPosition': ('leading', 'sidebarLoadingSpinnerPosition', ''),
+    'sidebar.makePullRequestsClickable': (True, 'sidebarMakePullRequestClickable', ''),
+    'sidebar.notificationBadgePosition': ('leading', 'sidebarNotificationBadgePosition', ''),
+    'sidebar.notificationMessageLineLimit': (12, 'sidebarNotificationMessageLineLimit', ''),
+    'sidebar.openPortLinksInCmuxBrowser': (True, 'browserOpenSidebarPortLinksInCmuxBrowser', ''),
+    'sidebar.openPullRequestLinksInCmuxBrowser': (True, 'browserOpenSidebarPullRequestLinksInCmuxBrowser', ''),
+    'sidebar.pathLastSegmentOnly': (False, 'sidebarPathLastSegmentOnly', ''),
+    'sidebar.rightMaxWidth': (False, 'rightSidebarMaxWidth', 'width'),
+    'sidebar.showAgentActivity': (True, 'sidebarShowAgentActivity', ''),
+    'sidebar.showBranchDirectory': (True, 'sidebarShowBranchDirectory', ''),
+    'sidebar.showCustomMetadata': (True, 'sidebarShowStatusPills', ''),
+    'sidebar.showLog': (True, 'sidebarShowLog', ''),
+    'sidebar.showNotificationMessage': (True, 'sidebarShowNotificationMessage', ''),
+    'sidebar.showPorts': (True, 'sidebarShowPorts', ''),
+    'sidebar.showProgress': (True, 'sidebarShowProgress', ''),
+    'sidebar.showPullRequests': (True, 'sidebarShowPullRequest', ''),
+    'sidebar.showSSH': (True, 'sidebarShowSSH', ''),
+    'sidebar.showWorkspaceDescription': (True, 'sidebarShowWorkspaceDescription', ''),
+    'sidebar.stackBranchDirectory': (False, 'sidebarBranchDirectoryStacked', ''),
+    'sidebar.watchGitStatus': (True, 'sidebarWatchGitStatus', ''),
+    'sidebar.wrapWorkspaceTitles': (False, 'sidebarWrapWorkspaceTitles', ''),
+    'sidebarAppearance.blendMode': ('withinWindow', 'sidebarBlendMode', ''),
+    'sidebarAppearance.blurOpacity': (1.0, 'sidebarBlurOpacity', ''),
+    'sidebarAppearance.cornerRadius': (0.0, 'sidebarCornerRadius', ''),
+    'sidebarAppearance.darkModeTintColor': (None, 'sidebarTintHexDark', 'color'),
+    'sidebarAppearance.lightModeTintColor': (None, 'sidebarTintHexLight', 'color'),
+    'sidebarAppearance.matchTerminalBackground': (False, 'sidebarMatchTerminalBackground', ''),
+    'sidebarAppearance.material': ('sidebar', 'sidebarMaterial', ''),
+    'sidebarAppearance.preset': ('nativeSidebar', 'sidebarPreset', ''),
+    'sidebarAppearance.state': ('followWindow', 'sidebarState', ''),
+    'sidebarAppearance.tintColor': ('#000000', 'sidebarTintHex', 'color'),
+    'sidebarAppearance.tintOpacity': (0.18, 'sidebarTintOpacity', ''),
+    'terminal.adaptiveDefaultTheme': (True, 'terminal.adaptiveDefaultTheme', ''),
+    'terminal.agentHibernation.enabled': (False, 'terminal.agentHibernation.enabled', ''),
+    'terminal.agentHibernation.idleSeconds': (5, 'terminal.agentHibernation.idleSeconds', ''),
+    'terminal.agentHibernation.maxLiveTerminals': (12, 'terminal.agentHibernation.maxLiveTerminals', ''),
+    'terminal.autoResumeAgentSessions': (True, 'terminal.autoResumeAgentSessions', ''),
+    'terminal.copyOnSelect': (False, 'terminal.copyOnSelect', ''),
+    'terminal.focusTextBoxOnNewTerminals': (False, 'terminal.focusTextBoxOnNewTerminals', ''),
+    'terminal.rendererRealization.enabled': (True, 'terminal.rendererRealization.enabled', ''),
+    'terminal.rendererRealization.idleSeconds': (5, 'terminal.rendererRealization.idleSeconds', ''),
+    'terminal.rendererRealization.maxWarmRenderers': (1, 'terminal.rendererRealization.maxWarmRenderers', ''),
+    'terminal.resumeCommands': ([], None, ''),
+    'terminal.runawayMemoryGuardrail.enabled': (False, 'terminal.runawayMemoryGuardrail.enabled', ''),
+    'terminal.runawayMemoryGuardrail.thresholdGB': (8, 'terminal.runawayMemoryGuardrail.thresholdGB', ''),
+    'terminal.scrollSpeed': (1.0, 'terminal.scrollSpeed', ''),
+    'terminal.sessionContentAlignment': ('center', 'terminal.sessionContentAlignment', ''),
+    'terminal.sessionContentMaxWidth': (False, 'terminal.sessionContentMaxWidth', 'width'),
+    'terminal.showScrollBar': (True, 'terminal.showScrollBar', ''),
+    'terminal.showTextBoxOnNewTerminals': (False, 'terminal.showTextBoxOnNewTerminals', ''),
+    'terminal.textBoxDefaultSubmitAction': ('text-entry', 'terminal.textBoxDefaultSubmitAction', ''),
+    'terminal.textBoxMaxLines': (10, 'terminal.textBoxMaxLines', ''),
+    'terminal.textBoxSubmitActions': ([], 'terminal.textBoxSubmitActions', 'json'),
+    'terminal.titleUpdates.coalescing.delayMilliseconds': (1000, 'terminal.titleUpdates.coalescing.delayMilliseconds', ''),
+    'terminal.titleUpdates.coalescing.enabled': (True, 'terminal.titleUpdates.coalescing.enabled', ''),
+    'terminal.titleUpdates.diagnostics': (False, 'terminal.titleUpdates.diagnostics', ''),
+    'terminal.uploadCommands': ([], None, ''),
+    'workspaceColors.colors': ({'Red': '#C0392B', 'Crimson': '#922B21', 'Orange': '#A04000', 'Amber': '#7D6608', 'Olive': '#4A5C18', 'Green': '#196F3D', 'Teal': '#006B6B', 'Aqua': '#0E6B8C', 'Blue': '#1565C0', 'Navy': '#1A5276', 'Indigo': '#283593', 'Purple': '#6A1B9A', 'Magenta': '#AD1457', 'Rose': '#880E4F', 'Brown': '#7B3F00', 'Charcoal': '#3E4B5E'}, 'workspaceTabColor.colors', 'palette'),
+    'workspaceColors.customColors': ([], None, ''),
+    'workspaceColors.indicatorStyle': ('leftRail', 'sidebarActiveTabIndicatorStyle', ''),
+    'workspaceColors.notificationBadgeColor': (None, 'sidebarNotificationBadgeColorHex', 'color'),
+    'workspaceColors.paletteOverrides': ({}, None, ''),
+    'workspaceColors.selectionColor': (None, 'sidebarSelectionColorHex', 'color'),
+    'workspaceGroups.anchorCloseSuppressed': (False, 'workspaceGroup.anchorCloseSuppressed', ''),
+    'workspaceGroups.newWorkspacePlacement': ('afterCurrent', 'workspaceGroup.newWorkspacePlacement', ''),
+}
+SETTINGS_CONSTRAINTS = {
+    'app.appIcon': {'enum': ['automatic', 'light', 'dark']},
+    'app.appearance': {'enum': ['system', 'light', 'dark']},
+    'app.confirmQuit': {'enum': ['always', 'dirty-only', 'never']},
+    'app.forkConversationDefaultDestination': {'enum': ['right', 'left', 'top', 'bottom', 'newTab', 'newWorkspace']},
+    'app.globalFontMagnification': {'minimum': 50, 'maximum': 200},
+    'app.language': {'enum': ['system', 'en', 'ar', 'bs', 'zh-Hans', 'zh-Hant', 'da', 'de', 'es', 'fr', 'it', 'ja', 'ko', 'nb', 'pl', 'pt-BR', 'ru', 'th', 'tr']},
+    'app.newWorkspacePlacement': {'enum': ['top', 'afterCurrent', 'end']},
+    'app.paneResizeStepPixels': {'minimum': 1, 'maximum': 200},
+    'automation.kiroNotificationLevel': {'enum': ['minimal', 'standard', 'verbose']},
+    'automation.portBase': {'minimum': 1},
+    'automation.portRange': {'minimum': 1},
+    'automation.socketControlMode': {'enum': ['off', 'cmuxOnly', 'automation', 'password', 'allowAll', 'openAccess', 'fullOpenAccess', 'notifications', 'full']},
+    'browser.defaultSearchEngine': {'enum': ['google', 'duckduckgo', 'bing', 'kagi', 'startpage', 'brave', 'perplexity', 'exa', 'yahoo', 'ecosia', 'qwant', 'mojeek', 'wikipedia', 'github', 'baidu', 'yandex', 'custom']},
+    'browser.defaultZoomLevel': {'minimum': 0.25, 'maximum': 5},
+    'browser.hiddenWebViewDiscardDelaySeconds': {'minimum': 0, 'maximum': 3600},
+    'browser.hostsToOpenInEmbeddedBrowser': {'strings': True},
+    'browser.insecureHttpHostsAllowedInEmbeddedBrowser': {'strings': True},
+    'browser.theme': {'enum': ['system', 'light', 'dark']},
+    'browser.urlAllowlist': {'strings': True},
+    'browser.urlsToAlwaysOpenExternally': {'strings': True},
+    'canvas.paneGap': {'minimum': 0, 'maximum': 64},
+    'diffViewer.defaultLayout': {'enum': ['unified', 'split']},
+    'fileEditor.tabWidth': {'minimum': 1, 'maximum': 8},
+    'fileExplorer.doubleClickAction': {'enum': ['preview', 'defaultEditor', 'preferredEditor']},
+    'markdown.fontSize': {'minimum': 8, 'maximum': 96},
+    'markdown.maxWidth': {'minimum': 320, 'maximum': 2400},
+    'mobile.artifactFolderAccess': {'enum': ['subtree', 'oneLevel']},
+    'notifications.agentTurnComplete': {'enum': ['whenIdle', 'always', 'never']},
+    'notifications.hooksMode': {'enum': ['append', 'replace']},
+    'notifications.sound': {'enum': ['default', 'Basso', 'Blow', 'Bottle', 'Frog', 'Funk', 'Glass', 'Hero', 'Morse', 'Ping', 'Pop', 'Purr', 'Sosumi', 'Submarine', 'Tink', 'custom_file', 'none']},
+    'sidebar.beta.workspaceTodos.checklistStyle': {'enum': ['popover', 'inline']},
+    'sidebar.branchLayout': {'enum': ['vertical', 'inline']},
+    'sidebar.loadingSpinnerPosition': {'enum': ['leading', 'trailing']},
+    'sidebar.notificationBadgePosition': {'enum': ['leading', 'trailing']},
+    'sidebar.notificationMessageLineLimit': {'minimum': 1, 'maximum': 50},
+    'sidebar.rightMaxWidth': {'minimum': 276},
+    'sidebarAppearance.tintOpacity': {'minimum': 0, 'maximum': 1},
+    'terminal.agentHibernation.idleSeconds': {'minimum': 5, 'maximum': 604800},
+    'terminal.agentHibernation.maxLiveTerminals': {'minimum': 1, 'maximum': 256},
+    'terminal.rendererRealization.idleSeconds': {'minimum': 5, 'maximum': 604800},
+    'terminal.rendererRealization.maxWarmRenderers': {'minimum': 1, 'maximum': 256},
+    'terminal.scrollSpeed': {'minimum': 0.25, 'maximum': 3.0},
+    'terminal.sessionContentAlignment': {'enum': ['left', 'center', 'right']},
+    'terminal.sessionContentMaxWidth': {'minimum': 320},
+    'terminal.textBoxMaxLines': {'minimum': 1, 'maximum': 20},
+    'workspaceColors.indicatorStyle': {'enum': ['leftRail', 'solidFill', 'rail', 'border', 'wash', 'lift', 'typography', 'washRail', 'blueWashColorRail']},
+    'workspaceGroups.newWorkspacePlacement': {'enum': ['afterCurrent', 'top', 'end']},
+}
+SETTINGS_PREF_ONLY = frozenset((
+    "app.fileDropDefaultBehavior", "app.systemWideHotkeyEnabled", "app.titlebarControlsStyle",
+    "app.workspaceButtonFade", "app.workspaceTitlebarVisibility", "browser.disabled",
+    "mobile.iOSPairingHost.displayName", "mobile.iOSPairingHost.enabled", "mobile.iOSPairingHost.port",
+    "mobile.phonePush.forwardingEnabled", "mobile.phonePush.hideContent", "mobile.phonePush.mode",
+    "sidebarAppearance.blendMode", "sidebarAppearance.blurOpacity", "sidebarAppearance.cornerRadius",
+    "sidebarAppearance.material", "sidebarAppearance.preset", "sidebarAppearance.state",
+    "terminal.runawayMemoryGuardrail.enabled", "terminal.runawayMemoryGuardrail.thresholdGB",
+    "terminal.titleUpdates.coalescing.delayMilliseconds", "terminal.titleUpdates.coalescing.enabled",
+    "terminal.titleUpdates.diagnostics", "workspaceGroups.anchorCloseSuppressed"))
+SHORTCUT_DEFAULTS = {
+    'attachTextBoxFile': 'alt+shift+cmd+a',
+    'browserBack': 'cmd+[',
+    'browserForward': 'cmd+]',
+    'browserHardReload': 'shift+cmd+r',
+    'browserReload': 'cmd+r',
+    'browserZoomIn': 'cmd+=',
+    'browserZoomOut': 'cmd+-',
+    'browserZoomReset': 'cmd+0',
+    'canvasAlignBottom': None,
+    'canvasAlignLeft': None,
+    'canvasAlignRight': None,
+    'canvasAlignTop': None,
+    'canvasDistributeHorizontally': None,
+    'canvasDistributeVertically': None,
+    'canvasEqualizeHeights': None,
+    'canvasEqualizeWidths': None,
+    'canvasOverview': 'ctrl+cmd+o',
+    'canvasRevealFocusedPane': 'ctrl+cmd+r',
+    'canvasTidy': 'ctrl+cmd+t',
+    'canvasZoomIn': 'alt+cmd+=',
+    'canvasZoomOut': 'alt+cmd+-',
+    'canvasZoomReset': 'cmd+0',
+    'clearAllNotifications': None,
+    'clearScreenKeepScrollback': 'shift+cmd+k',
+    'closeOtherTabsInPane': 'alt+cmd+t',
+    'closeTab': 'cmd+w',
+    'closeWindow': 'ctrl+cmd+w',
+    'closeWorkspace': 'shift+cmd+w',
+    'commandPalette': 'shift+cmd+p',
+    'commandPaletteNext': 'ctrl+n',
+    'commandPalettePrevious': 'ctrl+p',
+    'cycleTextBoxSubmitAction': 'shift+tab',
+    'cycleWorkspaceStatus': 'shift+cmd+;',
+    'decreaseWorkspaceTerminalFontSize': 'ctrl+cmd+-',
+    'diffViewerNextFile': [']', 'f'],
+    'diffViewerOpenFileSearch': '/',
+    'diffViewerPreviousFile': ['[', 'f'],
+    'diffViewerScrollDown': 'j',
+    'diffViewerScrollDownEmacs': 'ctrl+n',
+    'diffViewerScrollHalfPageDown': 'ctrl+d',
+    'diffViewerScrollHalfPageUp': 'ctrl+u',
+    'diffViewerScrollToBottom': 'shift+g',
+    'diffViewerScrollToTop': ['g', 'g'],
+    'diffViewerScrollUp': 'k',
+    'diffViewerScrollUpEmacs': 'ctrl+p',
+    'editWorkspaceDescription': 'alt+cmd+e',
+    'equalizeSplits': 'ctrl+shift+cmd+=',
+    'fileExplorerOpenSelection': 'enter',
+    'fileExplorerOpenSelectionFinderAlias': 'cmd+↓',
+    'find': 'cmd+f',
+    'findInDirectory': 'shift+cmd+f',
+    'findNext': 'cmd+g',
+    'findPrevious': 'alt+cmd+g',
+    'focusBrowserAddressBar': 'cmd+l',
+    'focusDown': 'alt+cmd+↓',
+    'focusHistoryBack': 'cmd+[',
+    'focusHistoryForward': 'cmd+]',
+    'focusLeft': 'alt+cmd+←',
+    'focusNextPane': None,
+    'focusPreviousPane': None,
+    'focusRight': 'alt+cmd+→',
+    'focusRightSidebar': 'shift+cmd+e',
+    'focusTextBoxInput': 'shift+cmd+a',
+    'focusUp': 'alt+cmd+↑',
+    'globalSearch': 'alt+cmd+f',
+    'goToWorkspace': 'cmd+p',
+    'groupSelectedWorkspaces': 'shift+cmd+g',
+    'hideFind': 'alt+shift+cmd+f',
+    'increaseWorkspaceTerminalFontSize': 'ctrl+cmd+=',
+    'jumpToUnread': 'shift+cmd+u',
+    'markAllNotificationsRead': None,
+    'markOldestUnreadAndJumpNext': 'ctrl+cmd+u',
+    'markWorkspaceDone': 'cmd+;',
+    'markdownZoomIn': 'cmd+=',
+    'markdownZoomOut': 'cmd+-',
+    'markdownZoomReset': 'cmd+0',
+    'moveSurfaceLeft': 'alt+shift+cmd+[',
+    'moveSurfaceRight': 'alt+shift+cmd+]',
+    'moveSurfaceToNextPane': 'ctrl+shift+cmd+]',
+    'moveSurfaceToPaneDown': 'alt+shift+cmd+↓',
+    'moveSurfaceToPaneLeft': 'alt+shift+cmd+←',
+    'moveSurfaceToPaneRight': 'alt+shift+cmd+→',
+    'moveSurfaceToPaneUp': 'alt+shift+cmd+↑',
+    'moveSurfaceToPreviousPane': 'ctrl+shift+cmd+[',
+    'moveWorkspaceDown': 'ctrl+alt+cmd+]',
+    'moveWorkspaceUp': 'ctrl+alt+cmd+[',
+    'newBrowserWorkspace': 'alt+cmd+n',
+    'newCloudMachine': 'shift+cmd+y',
+    'newCloudWorkspace': 'cmd+y',
+    'newSurface': 'cmd+t',
+    'newTab': 'cmd+n',
+    'newWindow': 'shift+cmd+n',
+    'newWorkspaceGroup': 'ctrl+cmd+g',
+    'nextSidebarTab': 'ctrl+cmd+]',
+    'nextSidebarTabInGroup': None,
+    'nextSurface': 'shift+cmd+]',
+    'openBrowser': 'shift+cmd+l',
+    'openDiffViewer': 'ctrl+shift+cmd+d',
+    'openFolder': 'cmd+o',
+    'openSettings': 'cmd+,',
+    'prevSidebarTab': 'ctrl+cmd+[',
+    'prevSidebarTabInGroup': None,
+    'prevSurface': 'shift+cmd+[',
+    'quit': 'cmd+q',
+    'reloadConfiguration': 'shift+cmd+,',
+    'renameTab': 'cmd+r',
+    'renameWorkspace': 'shift+cmd+r',
+    'reopenClosedBrowserPanel': 'shift+cmd+t',
+    'reopenClosedWorkspace': None,
+    'reopenPreviousSession': 'shift+cmd+o',
+    'resetWorkspaceTerminalFontSize': 'ctrl+cmd+0',
+    'resizePaneDown': 'ctrl+shift+j',
+    'resizePaneLeft': 'ctrl+shift+h',
+    'resizePaneRight': 'ctrl+shift+l',
+    'resizePaneUp': 'ctrl+shift+k',
+    'saveFilePreview': 'cmd+s',
+    'saveLayoutTemplate': 'ctrl+cmd+s',
+    'selectSurfaceByNumber': 'ctrl+1',
+    'selectWorkspaceByNumber': 'cmd+1',
+    'sendCtrlFToTerminal': None,
+    'sendFeedback': None,
+    'showBrowserJavaScriptConsole': 'alt+cmd+c',
+    'showHideAllWindows': 'ctrl+alt+cmd+.',
+    'showNotifications': 'cmd+i',
+    'simulatorHome': 'shift+cmd+h',
+    'simulatorRotateLeft': 'cmd+left',
+    'simulatorRotateRight': 'cmd+right',
+    'simulatorToggleAppearance': 'shift+cmd+a',
+    'simulatorToggleSoftwareKeyboard': 'cmd+k',
+    'splitBrowserDown': 'alt+shift+cmd+d',
+    'splitBrowserRight': 'alt+cmd+d',
+    'splitDown': 'shift+cmd+d',
+    'splitRight': 'cmd+d',
+    'toggleBrowserDesignMode': 'ctrl+alt+cmd+d',
+    'toggleBrowserDeveloperTools': 'alt+cmd+i',
+    'toggleBrowserFocusMode': 'alt+cmd+enter',
+    'toggleCanvasLayout': 'ctrl+cmd+c',
+    'toggleChecklistItemComplete': 'cmd+enter',
+    'toggleFocusedWorkspaceGroupCollapsed': 'ctrl+cmd+.',
+    'toggleFullScreen': 'ctrl+cmd+f',
+    'toggleReactGrab': 'shift+cmd+g',
+    'toggleRightSidebar': 'alt+cmd+b',
+    'toggleSidebar': 'cmd+b',
+    'toggleSplitZoom': 'shift+cmd+enter',
+    'toggleTerminalCopyMode': 'shift+cmd+m',
+    'toggleUnread': 'alt+cmd+u',
+    'triggerFlash': 'shift+cmd+h',
+    'useSelectionForFind': 'cmd+e',
+}
+# These defaults depend on the visible, reordered right-sidebar tabs.
+SHORTCUT_DYNAMIC = frozenset(('switchRightSidebarToFiles', 'switchRightSidebarToFind', 'switchRightSidebarToSessions', 'switchRightSidebarToFeed', 'switchRightSidebarToDock', 'switchRightSidebarToMachines'))
+
 HELP = """usage: {prog} [--all] [--no-interactive]
        {prog} reopen <n> [--plain]
+       {prog} delete <n>
+       {prog} settings diff
 
 List cmux workspaces you've closed, and reopen them.
 
 With no command this opens an interactive browser: up/down (or k/j) to move,
-enter to reopen, / to filter, ? for all keys, q or esc to
+enter to reopen, d to delete, s for settings differences, / to filter, ? for all keys, q or esc to
 quit. It prints the plain listing instead when output is not a terminal, when
 TERM is unset or "dumb", or with --no-interactive.
 
@@ -69,6 +465,11 @@ Commands:
   reopen <n>        Rebuild workspace <n> from cmux's snapshot: split layout,
                     terminal directories, AI panes resumed, browser tabs,
                     saved workspace color, and workspace group.
+  delete <n>        Remove all existing closes of workspace <n> from this tool.
+                    Requires a terminal: type exactly YES and press enter.
+                    cmux's native History is preserved; future closes can appear.
+  settings diff     Compare local cmux settings with verified factory defaults.
+                    Read-only; does not load or harvest workspace history.
 
 Options:
   --all             Show the raw close history instead of the default
@@ -78,8 +479,8 @@ Options:
                     empty workspace at the original directory.
   -h, --help        Show this message and exit.
 
-reopen <n> numbering always follows the default view, so --all output is
-for inspection only.
+reopen <n> and delete <n> numbering always follows the default view,
+including when --all is supplied. Deleted entries stay hidden under --all.
 Search matches title, path, or saved group name. Reopening follows an existing
 group into its window, or recreates a missing named group in the caller's window.
 """
@@ -109,6 +510,428 @@ def read_json(path):
             return json.load(f)
     except (OSError, ValueError, RecursionError):
         return None
+
+def parse_jsonc(text):
+    """Remove comments and trailing commas without touching quoted strings."""
+    for comments in (True, False):
+        out, i = [], 0
+        while i < len(text):
+            c = text[i]
+            if c == '"':
+                start, i = i, i + 1
+                while i < len(text):
+                    if text[i] == "\\":
+                        i += 2
+                    elif text[i] == '"':
+                        i += 1
+                        break
+                    else:
+                        i += 1
+                out.append(text[start:i])
+                continue
+            if comments and text.startswith("//", i):
+                end = text.find("\n", i + 2)
+                i = len(text) if end < 0 else end
+                out.append(" ")
+                continue
+            if comments and text.startswith("/*", i):
+                end = text.find("*/", i + 2)
+                if end < 0:
+                    raise ValueError("unterminated comment")
+                i = end + 2
+                out.append(" ")
+                continue
+            if not comments and c == ",":
+                next_i = i + 1
+                while next_i < len(text) and text[next_i].isspace():
+                    next_i += 1
+                if next_i < len(text) and text[next_i] in "]}":
+                    i += 1
+                    continue
+            out.append(c)
+            i += 1
+        text = "".join(out)
+    def reject_constant(value):
+        raise ValueError("non-finite JSON number")
+    return json.loads(text.lstrip("\ufeff"), parse_constant=reject_constant)
+
+def settings_file(path, label, notices):
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            text = f.read(2 * 1024 * 1024 + 1)
+        if len(text) > 2 * 1024 * 1024:
+            raise ValueError("settings file too large")
+        data = parse_jsonc(text)
+        if not isinstance(data, dict):
+            raise ValueError("expected settings object")
+        version = data.get("schemaVersion", 1)
+        if type(version) is not int or version != 1:
+            notices.append(f"Unverified schema version in {label}; reading known settings only.")
+        return data, "parsed"
+    except FileNotFoundError:
+        return {}, "missing"
+    except (OSError, ValueError, RecursionError):
+        notices.append(f"Could not read {label}; comparison is incomplete.")
+        return {}, "invalid"
+
+def settings_app(notices):
+    """Identify the CLI's app without opening a window or needing its socket."""
+    version, commit, domain, info = "", "", "com.cmuxterm.app", {}
+    binary = os.path.realpath(shutil.which("cmux") or "")
+    if ".app/Contents/" in binary:
+        path = binary.split(".app/Contents/", 1)[0] + ".app/Contents/Info.plist"
+        try:
+            with open(path, "rb") as f:
+                info = as_dict(plistlib.load(f))
+            identifier = as_text(info.get("CFBundleIdentifier"))
+            if re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]*", identifier):
+                domain = identifier
+        except (OSError, ValueError, plistlib.InvalidFileException, ExpatError, RecursionError):
+            pass
+    try:
+        result = subprocess.run(["cmux", "--version"], capture_output=True,
+                                text=True, timeout=3)
+        match = re.search(r"\bcmux (\d+\.\d+\.\d+)\b", result.stdout) if result.returncode == 0 else None
+        if match:
+            version = match[1]
+            sha = re.search(r"\[([0-9a-f]{7,40})\]", result.stdout)
+            commit = sha[1] if sha else ""
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        pass
+    if not version:
+        version = as_text(info.get("CFBundleShortVersionString"))
+        if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+            version = ""
+    verified = (version == SETTINGS_VERSION and
+                (not commit or commit.startswith(SETTINGS_COMMIT) or SETTINGS_COMMIT.startswith(commit)))
+    if not verified:
+        label = version if re.fullmatch(r"\d+\.\d+\.\d+", version) else "unavailable"
+        notices.append(f"cmux version {label}: defaults are verified only for {SETTINGS_VERSION} "
+                       f"({SETTINGS_COMMIT}); displayed comparisons are unverified.")
+    return version, domain, verified
+
+def settings_preferences(domain, notices):
+    """Export in memory; only allowlisted setting keys reach the report."""
+    try:
+        result = subprocess.run(["defaults", "export", domain, "-"],
+                                capture_output=True, timeout=3)
+        if result.returncode == 0:
+            data = plistlib.loads(result.stdout)
+            if not isinstance(data, dict):
+                raise ValueError("expected preference dictionary")
+            return data, True
+        if b"does not exist" in result.stderr.lower():
+            return {}, True
+    except (OSError, ValueError, plistlib.InvalidFileException, ExpatError,
+            RecursionError, OverflowError, subprocess.TimeoutExpired):
+        pass
+    path = os.path.expanduser(f"~/Library/Preferences/{domain}.plist")
+    try:
+        with open(path, "rb") as f:
+            data = plistlib.load(f)
+        if isinstance(data, dict):
+            notices.append("Using the saved preference file; live macOS preferences were unavailable.")
+            return data, False
+    except (OSError, ValueError, plistlib.InvalidFileException, ExpatError, RecursionError, OverflowError):
+        pass
+    notices.append("Could not read macOS preferences; comparison is incomplete.")
+    return {}, False
+
+def setting_at(data, key):
+    for part in key.split("."):
+        if not isinstance(data, dict) or part not in data:
+            raise KeyError(key)
+        data = data[part]
+    return data
+
+def normalize_setting(key, value, preferences=False):
+    default, pref, codec = SETTINGS_DEFAULTS[key]
+    if codec == "inverse" and preferences and type(value) is bool:
+        value = not value
+    elif codec == "minimal" and preferences:
+        if value not in ("standard", "minimal"):
+            raise ValueError("unknown presentation mode")
+        value = value == "minimal"
+    elif codec == "branch" and preferences and type(value) is bool:
+        value = "vertical" if value else "inline"
+    elif codec == "width":
+        if value is False or (preferences and finite_number(value) and value <= 0):
+            return False
+        if not finite_number(value) or value <= 0:
+            raise ValueError("invalid width")
+        if key.startswith("terminal."):
+            return max(320, math.floor(value / 20 + 0.5) * 20)
+        return min(4096, max(276, math.floor(value + 0.5)))
+    elif codec == "color":
+        if value is None or value == "":
+            if default is not None:
+                raise ValueError("color is not nullable")
+            return None
+        if not isinstance(value, str) or not re.fullmatch(r"#?[0-9a-fA-F]{6}", value.strip()):
+            raise ValueError("invalid color")
+        return "#" + value.strip().lstrip("#").upper()
+    elif codec == "lines":
+        if preferences and isinstance(value, str):
+            value = value.splitlines()
+        if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+            raise ValueError("invalid patterns")
+        return list(dict.fromkeys(v.strip() for v in value if v.strip()))
+    elif codec == "json" and preferences and isinstance(value, (str, bytes)):
+        value = json.loads(value or "[]")
+    elif codec == "socket" and isinstance(value, str):
+        modes = {"off": "off", "cmuxonly": "cmuxOnly", "notifications": "cmuxOnly",
+                 "automation": "automation", "password": "password", "allowall": "allowAll",
+                 "openaccess": "allowAll", "fullopenaccess": "allowAll", "full": "allowAll"}
+        value = modes.get(value.replace("-", "").lower(), value)
+    elif codec == "palette":
+        if not isinstance(value, dict) or any(not isinstance(v, str) for v in value.values()):
+            raise ValueError("invalid palette")
+        normalized = {}
+        for name, color in value.items():
+            if not name.strip() or not re.fullmatch(r"#?[0-9a-fA-F]{6}", color.strip()):
+                raise ValueError("invalid palette color")
+            normalized[name.strip()] = "#" + color.strip().lstrip("#").upper()
+        return normalized
+    if type(default) is bool:
+        valid = type(value) is bool
+    elif finite_number(default):
+        valid = finite_number(value) and (type(default) is not int or int(value) == value)
+    else:
+        valid = isinstance(value, type(default))
+    if not valid:
+        raise ValueError("invalid setting type")
+    rules = SETTINGS_CONSTRAINTS.get(key, {})
+    if "enum" in rules and value not in rules["enum"]:
+        raise ValueError("unknown enum value")
+    if finite_number(value):
+        if value < rules.get("minimum", -math.inf) or value > rules.get("maximum", math.inf):
+            raise ValueError("setting out of range")
+    if rules.get("strings") and any(not isinstance(v, str) for v in value):
+        raise ValueError("invalid array value")
+    if isinstance(value, str):
+        if not rules.get("minLength", 0) <= len(value) <= rules.get("maxLength", math.inf):
+            raise ValueError("invalid string length")
+        if "pattern" in rules and not re.search(rules["pattern"], value):
+            raise ValueError("invalid string value")
+    json.dumps(value, allow_nan=False)  # reject nested non-finite numbers and plist-only values
+    return value
+
+def normalize_shortcut(value, preferences=False):
+    aliases = {"command": "cmd", "super": "cmd", "meta": "cmd", "control": "ctrl",
+               "option": "alt", "opt": "alt", "return": "enter", "esc": "escape",
+               "spacebar": "space", "delete": "backspace", "forwarddelete": "delete",
+               "plus": "=", "equals": "=", "comma": ",", "period": ".",
+               "leftarrow": "left", "rightarrow": "right", "uparrow": "up", "downarrow": "down",
+               "semicolon": ";", "quote": "'", "apostrophe": "'", "backtick": "`", "grave": "`",
+               "minus": "-", "hyphen": "-", "leftbracket": "[", "openbracket": "[",
+               "rightbracket": "]", "closebracket": "]", "slash": "/", "backslash": "\\",
+               "←": "left", "→": "right", "↑": "up", "↓": "down",
+               "\r": "enter", "\t": "tab", "\x1b": "escape", "\x7f": "backspace",
+               "\uf700": "up", "\uf701": "down", "\uf702": "left", "\uf703": "right"}
+    def stroke(raw):
+        if not isinstance(raw, str):
+            raise ValueError("invalid shortcut stroke")
+        parts = [aliases.get(v.lower(), v.lower()) for v in raw.strip().split("+")]
+        mods, key = parts[:-1], parts[-1]
+        if any(v not in ("ctrl", "alt", "shift", "cmd") for v in mods) or not key:
+            raise ValueError("invalid shortcut modifiers")
+        if len(key) != 1 and key not in ("enter", "tab", "escape", "space", "backspace", "delete",
+                                       "up", "down", "left", "right", "home", "end", "pageup", "pagedown") \
+                and not re.fullmatch(r"f(?:[1-9]|[12][0-9]|3[0-5])", key):
+            raise ValueError("invalid shortcut key")
+        return "+".join([v for v in ("ctrl", "alt", "shift", "cmd") if v in mods] + [key])
+    if preferences:
+        if isinstance(value, (str, bytes)):
+            value = json.loads(value)
+        if not isinstance(value, dict) or not isinstance(value.get("key"), str):
+            raise ValueError("invalid saved shortcut")
+        if value["key"] == "":
+            return None
+        strokes = []
+        for prefix in ("", "chord"):
+            key = value.get(prefix + "Key" if prefix else "key")
+            if key is None:
+                continue
+            if not isinstance(key, str):
+                raise ValueError("invalid saved shortcut key")
+            key = aliases.get(key, "space" if key == " " else key)
+            flags = [("ctrl", "control"), ("alt", "option"), ("shift", "shift"), ("cmd", "command")]
+            mods = []
+            for modifier, name in flags:
+                if not prefix and name not in value:
+                    raise ValueError("missing saved shortcut modifier")
+                flag = value.get(prefix + name.title() if prefix else name, False)
+                if type(flag) is not bool:
+                    raise ValueError("invalid saved shortcut modifier")
+                if flag:
+                    mods.append(modifier)
+            strokes.append(stroke("+".join(mods + [key])))
+    else:
+        if value is None or (isinstance(value, str) and value.strip().lower() in ("", "none", "unbound", "disabled")):
+            return None
+        strokes = value if isinstance(value, list) else [value]
+        if not 1 <= len(strokes) <= 2:
+            raise ValueError("invalid shortcut chord")
+        if len(strokes) == 1 and isinstance(strokes[0], str) and strokes[0].strip().lower() in \
+                ("", "none", "unbound", "disabled"):
+            return None
+        strokes = [stroke(v) for v in strokes]
+    return strokes[0] if len(strokes) == 1 else strokes
+
+def settings_report():
+    notices, sources, configured = [], [], {}
+    version, domain, verified = settings_app(notices)
+    preferences, prefs_ok = settings_preferences(domain, notices)
+    paths = [("~/.config/cmux/cmux.json", "cmux.json"),
+             ("~/.config/cmux/settings.json", "settings.json"),
+             ("~/Library/Application Support/com.cmuxterm.app/settings.json", "Application Support settings.json")]
+    config_ok = True
+    for index, (path, label) in enumerate(paths):
+        data, state = settings_file(os.path.expanduser(path), label, notices)
+        if state == "invalid":
+            config_ok = False
+            if index == 0:
+                break  # cmux does not merge fallbacks into an invalid primary
+        sources.append((data, label))
+    for key in SETTINGS_DEFAULTS:
+        if key in SETTINGS_PREF_ONLY:
+            continue
+        for data, label in sources:
+            try:
+                configured[key] = (normalize_setting(key, setting_at(data, key)), label)
+                break
+            except KeyError:
+                pass
+            except (ValueError, TypeError, OverflowError, RecursionError):
+                notices.append(f"Invalid {key} in {label}; value skipped.")
+    # Unknown keys in settings sections deserve a notice; shared-file commands,
+    # actions, credentials and layout definitions never enter the report.
+    supported = set(SETTINGS_DEFAULTS) - SETTINGS_PREF_ONLY
+    supported |= {"shortcuts.bindings", "shortcuts.when", "automation.socketPassword", "workspaceGroups.byCwd"}
+    def unknown_keys(path, value):
+        if path in supported:
+            return []
+        if isinstance(value, dict) and any(k.startswith(path + ".") for k in supported):
+            return [k for name, child in value.items() for k in unknown_keys(path + "." + name, child)]
+        return [path]
+    for data, label in sources:
+        unknown = [key for section, value in data.items()
+                   if any(k.startswith(section + ".") for k in supported)
+                   for key in unknown_keys(section, value)]
+        if unknown:
+            names = ", ".join(sanitize(key)[:80] for key in unknown[:5])
+            notices.append(f"Unsupported settings in {label}: {names}" + (" ..." if len(unknown) > 5 else ""))
+    imported = preferences.get("cmux.settingsFile.importedManagedDefaults.v1", b"{}")
+    try:
+        imported = as_dict(json.loads(imported)) if isinstance(imported, (str, bytes)) else {}
+    except (ValueError, RecursionError):
+        imported = {}
+    items, checked = [], 0
+    def add(key, current, default, source, known):
+        if not known or current != default:
+            items.append({"setting": key, "current": current, "default": default,
+                          "source": source, "verified": known})
+    for key, (default, pref, codec) in SETTINGS_DEFAULTS.items():
+        current, source, present = default, "factory default", False
+        if key in configured:
+            current, source = configured[key]
+            present = True
+        if pref in preferences:
+            try:
+                current = normalize_setting(key, preferences[pref], preferences=True)
+                source, present = "macOS preferences", True
+            except (ValueError, TypeError, OverflowError, RecursionError):
+                notices.append(f"Invalid {key} in macOS preferences; value skipped.")
+                continue
+        elif codec in ("color", "palette") and pref in imported and current != default:
+            current, source, present = default, "macOS preferences (cleared)", True
+        if key == "app.confirmQuit" and pref not in preferences and "warnBeforeQuitShortcut" in preferences:
+            legacy = preferences["warnBeforeQuitShortcut"]
+            if type(legacy) is bool:
+                current, source, present = "always" if legacy else "never", "macOS preferences (legacy)", True
+        known = verified and (prefs_ok if pref else config_ok)
+        checked += int(known)
+        if present:
+            add(key, current, default, source, known)
+    bindings, contexts = {}, {}
+    for data, label in reversed(sources):
+        section = data.get("shortcuts", {})
+        if not isinstance(section, dict):
+            continue
+        for name, target in (("bindings", bindings), ("when", contexts)):
+            values = section.get(name, {})
+            if isinstance(values, dict):
+                target.update({action: (value, label) for action, value in values.items()})
+            else:
+                notices.append(f"Invalid shortcuts.{name} in {label}; values skipped.")
+    for action in sorted(set(SHORTCUT_DEFAULTS) | SHORTCUT_DYNAMIC | set(bindings)):
+        pref = "shortcut." + action
+        if action not in SHORTCUT_DEFAULTS and action not in SHORTCUT_DYNAMIC:
+            notices.append(f"Unsupported shortcut action: {sanitize(action)[:80]}.")
+            continue
+        known = verified and action in SHORTCUT_DEFAULTS and (config_ok if action in bindings else prefs_ok)
+        checked += int(known)
+        default = SHORTCUT_DEFAULTS.get(action)
+        try:
+            if action in bindings:  # cmux's file-managed shortcut bindings outrank preferences
+                value, source = bindings[action]
+                current = normalize_shortcut(value)
+            elif pref in preferences:
+                current = normalize_shortcut(preferences[pref], preferences=True)
+                source = "macOS preferences"
+            else:
+                continue
+            add("shortcuts.bindings." + action, current, default, source, known)
+        except (ValueError, TypeError, RecursionError):
+            notices.append(f"Invalid shortcut binding for {action}; value skipped.")
+    for action, (value, source) in sorted(contexts.items()):
+        if action in SHORTCUT_DEFAULTS or action in SHORTCUT_DYNAMIC:
+            if isinstance(value, str):
+                add("shortcuts.when." + action, value, None, source, False)
+            else:
+                notices.append(f"Invalid shortcut context for {action}; value skipped.")
+        else:
+            notices.append(f"Unsupported shortcut context action: {sanitize(action)[:80]}.")
+    items.sort(key=lambda item: item["setting"])
+    changed = sum(it["verified"] for it in items)
+    unverified = len(items) - changed
+    if unverified and verified:
+        notices.append("Some comparisons are unverified: their defaults depend on shortcut context "
+                       "or their current preferences were unavailable.")
+    notices = list(dict.fromkeys(notices))
+    return {"items": items, "version": version, "baseline": SETTINGS_VERSION, "checked": checked,
+            "changed": changed, "unverified": unverified, "notices": notices,
+            "complete": verified and not notices}
+
+def setting_value(item, default=False):
+    if default and not item["verified"]:
+        return "(unverified)"
+    value = item["default" if default else "current"]
+    if value is None and item["setting"].startswith("shortcuts.bindings."):
+        return "(unbound)"
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
+
+def settings_summary(report):
+    version = report["version"] or "unavailable"
+    return (f"cmux {version}: {report['changed']} changed, {report['unverified']} unverified, "
+            f"{report['checked']} settings checked")
+
+def print_settings(report):
+    print(settings_summary(report))
+    rows = [("Setting", "Current", "Default", "Source")] + [
+        (it["setting"], setting_value(it), setting_value(it, True), it["source"])
+        for it in report["items"]]
+    rows = [tuple(sanitize(value) for value in row) for row in rows]
+    widths = [max(dwidth(row[column]) for row in rows) for column in range(3)]
+    if report["items"]:
+        for row in rows:
+            print("  ".join([pad(row[i], widths[i]) for i in range(3)] + [row[3]]))
+    elif report["checked"]:
+        print(f"No differences among {report['checked']} verified settings.")
+    else:
+        print("No settings could be verified.")
+    for notice in report["notices"]:
+        sys.stderr.write("Settings: " + sanitize(notice) + "\n")
 
 def remember_group(catalog, group_id, name, ts):
     group_id, name = as_uuid(group_id), as_text(name).strip()
@@ -561,6 +1384,92 @@ def identity(it):
     return (norm_path(it["cwd"]) or it["id"],
             (it.get("custom") or "").strip().casefold())
 
+def event_close(ev):
+    p = as_dict(ev.get("payload"))
+    title = as_text(p.get("custom_title")) or as_text(p.get("title")) or as_text(p.get("new_title"))
+    return {"ts": iso_to_unix(ev.get("occurred_at")), "id": ev["workspace_id"],
+            "cwd": as_text(p.get("cwd")), "branch": "", "title": title,
+            "custom": as_text(p.get("custom_title"))}
+
+def load_deletions(strict=False):
+    """Listing tolerates damage; writes must preserve an existing readable file."""
+    empty = {"version": 1, "records": []}
+    try:
+        with open(DELETIONS) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return empty
+    except (OSError, ValueError, RecursionError):
+        if strict:
+            raise ValueError("Unreadable saved removals") from None
+        return empty
+    if (not isinstance(data, dict) or type(data.get("version")) is not int
+            or data["version"] != 1 or not isinstance(data.get("records"), list)):
+        if strict:
+            raise ValueError("Unsupported saved removals format")
+        return empty
+    return data
+
+def deletion_cutoffs():
+    keys, ids = {}, {}
+    for record in load_deletions()["records"]:
+        record = as_dict(record)
+        key, before = record.get("identity"), record.get("before")
+        if (not isinstance(key, list) or len(key) != 2
+                or any(not isinstance(v, str) or "\0" in v for v in key)
+                or not finite_number(before) or before < 0):
+            continue
+        key = tuple(key)
+        keys[key] = max(keys.get(key, 0), before)
+        for wsid in as_list(record.get("ids")):
+            wsid = as_text(wsid)
+            if wsid:
+                ids[wsid] = max(ids.get(wsid, 0), before)
+    return keys, ids
+
+def was_deleted(it, cutoffs):
+    keys, ids = cutoffs
+    return (it["ts"] <= keys.get(identity(it), -math.inf)
+            or bool(it["id"] and it["ts"] <= ids.get(it["id"], -math.inf)))
+
+def delete_entry(it):
+    """Persist removal metadata only, without editing either source history."""
+    temporary = None
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        # The separate lock remains stable across atomic replacements, so two
+        # managers cannot overwrite each other's confirmed removals.
+        with open(DELETIONS + ".lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            data = load_deletions(strict=True)
+            closes = native_closed() + [event_close(ev) for ev in load_events().values()
+                                       if ev["name"] == "workspace.closed"]
+            key = identity(it)
+            ids = {entry["id"] for entry in closes if identity(entry) == key and entry["id"]}
+            if it["id"]:
+                ids.add(it["id"])
+            matching = [entry for entry in closes
+                        if identity(entry) == key or entry["id"] in ids]
+            before = max([0, it["ts"]] + [entry["ts"] for entry in matching])
+            data["records"].append({"identity": list(key), "ids": sorted(ids), "before": before})
+            with tempfile.NamedTemporaryFile(mode="w", dir=LOG_DIR,
+                                             prefix=".workspace-deletions-", delete=False) as f:
+                temporary = f.name
+                json.dump(data, f, allow_nan=False)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, DELETIONS)
+        return None
+    except (OSError, ValueError, RecursionError) as e:
+        return f"Could not save removal ({e.__class__.__name__})."
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
 def dir_occupied(it, open_cwds, open_titles):
     """True when an open workspace already stands in for this closed one.
 
@@ -577,6 +1486,7 @@ def dir_occupied(it, open_cwds, open_titles):
 
 def entries(show_all=False):
     titles, ev_closed, created_at = {}, {}, {}
+    cutoffs = deletion_cutoffs()
     ordered = sorted(load_events().values(), key=lambda e: (
         iso_to_unix(e.get("occurred_at")), e.get("seq") if type(e.get("seq")) is int else 0))
     for ev in ordered:
@@ -586,18 +1496,17 @@ def entries(show_all=False):
             titles[wsid] = title
         ts = iso_to_unix(ev.get("occurred_at"))
         if ev["name"] == "workspace.closed":
-            ev_closed[wsid] = {"ts": ts, "id": wsid, "cwd": as_text(p.get("cwd")),
-                               "branch": "", "title": title or "",
-                               "custom": as_text(p.get("custom_title"))}
+            ev_closed[wsid] = event_close(ev)
         elif ev["name"] == "workspace.created":
             ev_closed.pop(wsid, None)  # reopened (e.g. session restore)
             created_at[wsid] = max(created_at.get(wsid, 0), ts)
     catalog = load_group_catalog()
-    native = native_closed(catalog)
+    native = [n for n in native_closed(catalog) if not was_deleted(n, cutoffs)]
     session_groups(catalog)
     native_ids = {n["id"] for n in native}
     items = [n for n in native if created_at.get(n["id"], 0) <= n["ts"]]
-    items += [e for e in ev_closed.values() if e["id"] not in native_ids]
+    items += [e for e in ev_closed.values()
+              if e["id"] not in native_ids and not was_deleted(e, cutoffs)]
     windows = cmux_windows()
     open_ids, open_cwds, open_titles = open_workspaces(as_list(windows))
     methods = as_list(as_dict(cmux_json(["capabilities"])).get("methods"))
@@ -972,7 +1881,7 @@ def draw_row(stdscr, st, y, num, it, selected, w):
 
 def hint_bar(st, w):
     frags = ([st["up"] + st["down"] + " move", st["enter"] + " reopen",
-              "/ search", "r refresh", "? keys", "q / esc quit"])
+              "d delete", "s settings", "/ search", "r refresh", "? keys", "q / esc quit"])
     while frags:
         s = "  ".join(frags)
         if dwidth(s) <= w - 2:
@@ -981,6 +1890,8 @@ def hint_bar(st, w):
     return ""
 
 def tui_draw(stdscr, st):
+    if st.get("screen") == "settings":
+        return tui_settings_draw(stdscr, st)
     h, w = stdscr.getmaxyx()
     a = st["attr"]
     stdscr.erase()
@@ -1017,7 +1928,7 @@ def tui_draw(stdscr, st):
             fit(f"filter: {sanitize(st['q'], st['ascii'])}   (esc to clear)",
                 w - 2, st["ell"]), w - 2, a["meta"])
     elif st["show_all"]:  # the on-screen twin of the --all footer note
-        put(stdscr, h - 2, 1, fit(f"all history {st['dash']} reopen <n> numbering "
+        put(stdscr, h - 2, 1, fit(f"all history {st['dash']} reopen/delete numbering "
                                   "follows the default view", w - 2, st["ell"]),
             w - 2, a["meta"])
     put(stdscr, h - 1, 0, pad(hint_bar(st, w), w), w, a["bar"])
@@ -1028,6 +1939,93 @@ def tui_draw(stdscr, st):
         except curses.error:
             pass
     stdscr.refresh()
+    if st.get("delete"):
+        tui_delete_draw(stdscr, st)
+
+def deletion_description(it, ascii_only=False):
+    return ["Workspace: " + sanitize(it["title"], ascii_only),
+            "Directory: " + sanitize(short_cwd(it, os.path.expanduser("~")), ascii_only),
+            "Remove all existing closes from this tool.",
+            "cmux's native History is preserved."]
+
+def deletion_fits(stdscr):
+    h, w = stdscr.getmaxyx()
+    return h >= 12 and w >= 48
+
+def tui_delete_draw(stdscr, st):
+    dialog, a = st["delete"], st["attr"]
+    h, w = stdscr.getmaxyx()
+    if not deletion_fits(stdscr):
+        put(stdscr, h - 2, 0, "Resize terminal to show confirmation.", w - 1, a["warn"])
+        stdscr.refresh()
+        return
+    bh, bw = 12, min(76, w)
+    win = curses.newwin(bh, bw, (h - bh) // 2, (w - bw) // 2)
+    win.bkgd(" ", a["hdr"])
+    win.box()
+    put(win, 1, 3, "Are you sure?", bw - 6, a["warn"])
+    lines = deletion_description(dialog["item"], st["ascii"])
+    for y, line in zip((3, 4, 6, 7), lines):
+        put(win, y, 3, fit(line, bw - 6, st["ell"]), bw - 6)
+    prompt = "Type YES: "
+    put(win, 8, 3, prompt + fit(sanitize(dialog["text"], st["ascii"]),
+                              bw - 6 - len(prompt), st["ell"]), bw - 6, a["title"])
+    put(win, 9, 3, fit(dialog["error"], bw - 6, st["ell"]), bw - 6, a["warn"])
+    put(win, 10, 3, "Enter confirms; Esc / Ctrl+C cancels", bw - 6)
+    try:
+        curses.curs_set(1)
+        win.move(8, min(bw - 4, 3 + len(prompt) + dwidth(dialog["text"])))
+    except curses.error:
+        pass
+    win.refresh()
+
+def tui_delete_key(stdscr, st, k):
+    dialog = st["delete"]
+    if k in (27, 3):
+        st["delete"], st["status"] = None, "Deletion cancelled."
+        stdscr.touchwin()
+    elif k in (curses.KEY_BACKSPACE, 127, 8):
+        dialog["text"], dialog["error"] = dialog["text"][:-1], ""
+    elif k == 21:
+        dialog["text"], dialog["error"] = "", ""
+    elif k in (10, 13, curses.KEY_ENTER):
+        if not deletion_fits(stdscr):
+            dialog["error"] = "Resize terminal to confirm."
+        elif dialog["text"] != "YES":
+            dialog["error"] = "Type YES exactly, then press Enter."
+        else:
+            error = delete_entry(dialog["item"])
+            if error:
+                dialog["error"] = error
+            else:
+                sel, off = st["sel"], st["off"]
+                st["delete"] = None
+                tui_load(stdscr, st)
+                st["sel"], st["off"] = clamp_view(sel, off, st["rows"], len(visible(st)))
+                st["status"] = "Removed workspace history from this tool."
+                stdscr.touchwin()
+    elif k == curses.KEY_RESIZE:
+        stdscr.erase()
+    elif isinstance(k, str) and k.isprintable():
+        dialog["text"], dialog["error"] = dialog["text"] + k, ""
+    return False
+
+def do_delete(it):
+    print("Are you sure?")
+    for line in deletion_description(it):
+        print(line)
+    try:
+        while input("Type YES and press Enter (Ctrl+C to cancel): ") != "YES":
+            print("Type YES exactly, then press Enter.")
+    except (EOFError, KeyboardInterrupt):
+        print("\nDeletion cancelled.", file=sys.stderr)
+        return 1
+    error = delete_entry(it)
+    if error:
+        print(error, file=sys.stderr)
+        return 1
+    print("Removed workspace history from this tool.")
+    return 0
 
 def tui_load(stdscr, st):
     """Fill the item list, showing a frame first because entries() is slow."""
@@ -1040,6 +2038,180 @@ def tui_load(stdscr, st):
         st["status"] = f"Could not read history ({e.__class__.__name__})."
     curses.flushinp()  # entries() blocks for seconds; drop keys typed meanwhile
                        # so an impatient enter cannot reopen a random workspace
+
+def settings_visible(view):
+    q = view["q"].casefold()
+    return [it for it in view["items"] if not q or any(q in text.casefold() for text in
+            (it["setting"], setting_value(it), setting_value(it, True), it["source"]))]
+
+def settings_detail_lines(st, width):
+    view = st["settings"]
+    item = view["detail"]
+    if item == "report":
+        report = view["report"]
+        lines = ["Settings report", "", settings_summary(report),
+                 f"Factory baseline: cmux {SETTINGS_VERSION} ({SETTINGS_COMMIT})", "",
+                 "Local cmux app settings and configured shortcuts.",
+                 "Ghostty configuration and managed device policies are not compared.", ""]
+        lines += report["notices"] or ["All available comparisons have verified defaults."]
+    else:
+        lines = [item["setting"], "", "Current:"]
+        lines += json.dumps(item["current"], indent=2, ensure_ascii=False, sort_keys=True).splitlines()
+        lines += ["", "Default:"]
+        lines += (json.dumps(item["default"], indent=2, ensure_ascii=False, sort_keys=True).splitlines()
+                  if item["verified"] else ["(unverified)"])
+        lines += ["", "Source: " + item["source"]]
+    wrapped = []
+    for line in lines:
+        line = sanitize(line, st["ascii"])
+        if not line:
+            wrapped.append("")
+        while line:
+            chunk = fit(line, max(1, width), "") or line[0]
+            wrapped.append(chunk)
+            line = line[len(chunk):]
+    return wrapped
+
+def tui_settings_draw(stdscr, st):
+    view, a = st["settings"], st["attr"]
+    h, w = stdscr.getmaxyx()
+    stdscr.erase()
+    if h < 7 or w < 30:
+        put(stdscr, 0, 0, "window too small", max(0, w - 1), a["warn"])
+        stdscr.refresh()
+        return
+    report = view["report"]
+    if view["detail"] is not None:
+        lines = settings_detail_lines(st, w - 4)
+        rows = h - 3
+        view["rows"] = rows
+        view["detail_off"] = max(0, min(view["detail_off"], max(0, len(lines) - rows)))
+        put(stdscr, 0, 1, "Settings details", w - 2, a["hdr"])
+        for y, line in enumerate(lines[view["detail_off"]:view["detail_off"] + rows], 1):
+            put(stdscr, y, 2, line, w - 4)
+        hint = " up/down scroll  pgup/pgdn page  enter / esc back  q quit"
+        put(stdscr, h - 1, 0, pad(fit(hint, w, st["ell"]), w), w, a["bar"])
+        stdscr.refresh()
+        return
+    vis = settings_visible(view)
+    rows = max(1, (h - 5) // 2)
+    view["rows"] = rows
+    view["sel"], view["off"] = clamp_view(view["sel"], view["off"], rows, len(vis))
+    head = "  Settings differences" + (" (incomplete)" if not report["complete"] and not view["status"] else "")
+    put(stdscr, 0, 0, fit(head, w - 1, st["ell"]), w - 1, a["hdr"])
+    count = f"{len(vis)} of {len(view['items'])}  "
+    if dwidth(head) + dwidth(count) + 2 < w:
+        put(stdscr, 0, w - 1 - dwidth(count), count, dwidth(count), a["time"])
+    stdscr.hline(1, 0, curses.ACS_HLINE, w)
+    key_w = min(48, max(10, (w - 6) // 2))
+    value_w = max(4, (w - key_w - 6) // 2)
+    def row_text(key, current, default):
+        return (pad(fit(key, key_w, st["ell"]), key_w) + "  " +
+                pad(fit(current, value_w, st["ell"]), value_w) + "  " +
+                fit(default, value_w, st["ell"]))
+    put(stdscr, 2, 2, row_text("Setting", "Current", "Default"), w - 3, a["meta"])
+    if not vis:
+        msg = view["status"] or ("No matching settings." if view["q"] else
+               f"No differences among {report['checked']} verified settings." if report["checked"] else
+               "No settings could be verified.")
+        put(stdscr, 3, 2, fit(msg, w - 4, st["ell"]), w - 4, a["warn"])
+    for index, item in enumerate(vis[view["off"]:view["off"] + rows], view["off"]):
+        y = 3 + (index - view["off"]) * 2
+        selected = index == view["sel"]
+        mark = st["mark"] + " " if selected else "  "
+        first = mark + row_text(sanitize(item["setting"], st["ascii"]),
+                                sanitize(setting_value(item), st["ascii"]),
+                                sanitize(setting_value(item, True), st["ascii"]))
+        source = "  " + item["source"] + (" (unverified comparison)" if not item["verified"] else "")
+        attr = a["sel"] if selected else a["title"]
+        put(stdscr, y, 0, pad(fit(first, w, st["ell"]), w), w, attr)
+        put(stdscr, y + 1, 0, pad(fit(source, w, st["ell"]), w), w,
+            a["sel"] if selected else a["meta"])
+    if view["mode"] == "search":
+        status, attr = "/" + view["q"], a["hdr"]
+    elif report["notices"]:
+        status, attr = report["notices"][0] + " (i for report)", a["warn"]
+    elif view["q"]:
+        status, attr = "filter: " + view["q"] + " (esc to clear)", a["meta"]
+    else:
+        status, attr = settings_summary(report), a["meta"]
+    if view["status"]:
+        status = view["status"]
+    put(stdscr, h - 2, 1, fit(sanitize(status, st["ascii"]), w - 2, st["ell"]), w - 2, attr)
+    frags = ["up/down move", "enter details", "/ search", "r refresh", "i report", "? keys", "esc workspaces", "q quit"]
+    while frags and dwidth("  ".join(frags)) > w - 2:
+        frags.pop()
+    put(stdscr, h - 1, 0, pad(" " + "  ".join(frags), w), w, a["bar"])
+    if view["mode"] == "search":
+        try:
+            curses.curs_set(1)
+            stdscr.move(h - 2, min(w - 1, 2 + dwidth(view["q"])))
+        except curses.error:
+            pass
+    stdscr.refresh()
+
+def tui_settings_load(stdscr, st):
+    if "settings" not in st:
+        st["settings"] = {"items": [], "report": {"complete": False, "checked": 0, "notices": [],
+                          "version": "", "changed": 0, "unverified": 0},
+                          "sel": 0, "off": 0, "q": "", "mode": "list", "rows": 1,
+                          "detail": None, "detail_off": 0, "status": ""}
+    view = st["settings"]
+    view["detail"], view["status"] = None, "Loading settings" + st["ell"]
+    tui_settings_draw(stdscr, st)
+    view["report"] = settings_report()
+    view["items"], view["status"] = view["report"]["items"], ""
+    curses.flushinp()
+
+def tui_settings_key(stdscr, st, k):
+    view = st["settings"]
+    if view["mode"] == "search":
+        return search_key(view, k)
+    if k in ("q", 3):
+        return True
+    if k == "r":
+        tui_settings_load(stdscr, st)
+        return False
+    if k == "?":
+        help_overlay(stdscr, st)
+        return False
+    detail = view["detail"] is not None
+    target = "detail_off" if detail else "sel"
+    if k in (curses.KEY_UP, "k", 16):
+        view[target] -= 1
+    elif k in (curses.KEY_DOWN, "j", 14):
+        view[target] += 1
+    elif k in (curses.KEY_PPAGE, 2):
+        view[target] -= view["rows"]
+    elif k in (curses.KEY_NPAGE, 6, " "):
+        view[target] += view["rows"]
+    elif k in (curses.KEY_HOME, "g"):
+        view[target] = 0
+    elif k in (curses.KEY_END, "G"):
+        view[target] = (len(settings_detail_lines(st, max(1, stdscr.getmaxyx()[1] - 4)))
+                        if detail else len(settings_visible(view)) - 1)
+    elif k == 27:
+        if detail:
+            view["detail"] = None
+        elif view["q"]:
+            view["q"] = ""
+        else:
+            st["screen"] = "workspaces"
+    elif k in (10, 13, curses.KEY_ENTER):
+        if detail:
+            view["detail"] = None
+        else:
+            vis = settings_visible(view)
+            if vis:
+                view["detail"] = vis[max(0, min(view["sel"], len(vis) - 1))]
+            else:
+                view["detail"] = "report"
+            view["detail_off"] = 0
+    elif k == "/" and not detail:
+        view["mode"] = "search"
+    elif k == "i":
+        view["detail"], view["detail_off"] = "report", 0
+    return False
 
 def read_key(win):
     """int for special and control keys, str for typed text, None if interrupted.
@@ -1073,6 +2245,8 @@ def help_overlay(stdscr, st):
     lines = ["up / k        move up", "down / j      move down",
              "pgup pgdn     page", "home g / end G  first / last",
              "enter         reopen with its saved layout",
+             "d             delete; type YES and enter to confirm",
+             "s             settings differences",
              "/             filter by title, path, or group",
              "esc           clear the filter, quit when none",
              "r             reload",
@@ -1081,6 +2255,17 @@ def help_overlay(stdscr, st):
              "earlier close of the same workspace.",
              "dir open means another workspace is already",
              "on that directory; reopening adds a second."]
+    if st.get("screen") == "settings":
+        lines = ["up / k, down / j  move; scroll in details",
+                 "pgup pgdn         page", "home g / end G    first / last",
+                 "enter             full setting values / back",
+                 "/                 search setting, value, source",
+                 "esc               clear filter, then workspaces",
+                 "r                 refresh settings only",
+                 "i                 version, coverage, and notices",
+                 "?                 this help", "q                 quit", "",
+                 "Read-only. Unverified defaults are marked.",
+                 "Ghostty settings are not compared."]
     h, w = stdscr.getmaxyx()
     bh, bw = min(len(lines) + 4, h), min(max(len(s) for s in lines) + 6, w)
     win = curses.newwin(bh, bw, max(0, (h - bh) // 2), max(0, (w - bw) // 2))
@@ -1096,6 +2281,10 @@ def help_overlay(stdscr, st):
 
 def tui_key(stdscr, st, k):
     """Handle one key. Returns True to leave the loop."""
+    if st.get("delete"):
+        return tui_delete_key(stdscr, st, k)
+    if st.get("screen") == "settings":
+        return tui_settings_key(stdscr, st, k)
     if st["mode"] == "search":
         return search_key(st, k)
     vis, rows = visible(st), st["rows"]
@@ -1113,12 +2302,21 @@ def tui_key(stdscr, st, k):
         st["sel"] = len(vis) - 1
     elif k == "/":
         st["mode"], st["status"] = "search", ""
+    elif k == "d":
+        if vis:
+            st["delete"] = {"item": dict(vis[max(0, min(st["sel"], len(vis) - 1))]),
+                            "text": "", "error": ""}
+        else:
+            st["status"] = "No closed workspace selected."
     elif k == 27:                       # esc backs out: filter first, then app
         if not st["q"]:
             return True
         st["q"] = ""
     elif k == "r":
         tui_load(stdscr, st)
+    elif k == "s":
+        st["screen"] = "settings"
+        tui_settings_load(stdscr, st)
     elif k == "?":
         help_overlay(stdscr, st)
     elif k in (10, 13, curses.KEY_ENTER):
@@ -1147,10 +2345,16 @@ def tui_main(stdscr, st):
         tui_load(stdscr, st)
         while True:
             tui_draw(stdscr, st)
-            k = read_key(stdscr)
+            try:
+                k = read_key(stdscr)
+            except KeyboardInterrupt:
+                if not st.get("delete"):
+                    raise
+                k = 3  # cbreak terminals deliver Ctrl+C as a signal, not a key
             if k is not None and tui_key(stdscr, st, k):
                 return
-            if st["mode"] != "search":
+            view = st["settings"] if st.get("screen") == "settings" else st
+            if view["mode"] != "search" and not st.get("delete"):
                 try:
                     curses.curs_set(0)
                 except curses.error:
@@ -1206,6 +2410,31 @@ def main():
     if bad:
         sys.exit(f"{prog}: unrecognized option: {bad[0]}\n"
                  f"Try '{prog} --help' for more information.")
+    if args and args[0] == "settings":
+        if argv != ["settings", "diff"]:
+            sys.exit(f"usage: {prog} settings diff\n"
+                     f"Try '{prog} --help' for more information.")
+        report = settings_report()
+        print_settings(report)
+        return 0 if report["complete"] else 1
+    if args and args[0] == "delete":
+        usage = (f"usage: {prog} delete <n>   (run with no args to see numbers)\n"
+                 f"Try '{prog} --help' for more information.")
+        if len(args) != 2 or plain or no_tui or not re.fullmatch(r"[0-9]+", args[1]):
+            sys.exit(usage)
+        try:
+            index = int(args[1])
+        except ValueError:
+            sys.exit(usage)
+        if index < 1:
+            sys.exit(usage)
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            sys.exit(f"{prog}: delete requires an interactive terminal for YES confirmation.\n"
+                     f"Try '{prog} --help' for more information.")
+        items = entries()  # deletion uses the same numbering as reopen, even with --all
+        if index > len(items):
+            sys.exit(usage)
+        return do_delete(dict(items[index - 1]))
     if args and args[0] == "reopen":
         items = entries()  # reopen indices always refer to the default filtered list
         if len(args) < 2 or not args[1].isdigit() or not (1 <= int(args[1]) <= len(items)):
@@ -1221,4 +2450,4 @@ def main():
     print_list(entries(show_all), show_all, prog)
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

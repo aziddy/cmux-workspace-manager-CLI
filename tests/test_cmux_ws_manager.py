@@ -3,16 +3,23 @@
 Run with: python3 -m unittest discover -s tests -v
 """
 import contextlib
+import fcntl
 import importlib.machinery
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import plistlib
+import pty
+import select
 import shlex
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
+import time
 import unittest
 from unittest import mock
 
@@ -24,6 +31,11 @@ GROUP_C = "33333333-3333-4333-8333-333333333333"
 WINDOW_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 WINDOW_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 GROUP_METHODS = ["workspace.group.list", "workspace.group.add", "workspace.group.create"]
+
+
+def controlling_terminal():
+    os.setsid()
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 FAKE_CMUX = '''
 import json, os, sys
 from pathlib import Path
@@ -33,7 +45,10 @@ with (root / "calls.jsonl").open("a") as f:
     f.write(json.dumps(args) + "\\n")
 config = json.loads((root / "fake.json").read_text())
 command = args[0]
-if command == "capabilities":
+if command == "--version":
+    print(config.get("version", "cmux 0.64.25 (106) [b685a275c]"))
+    sys.exit(config.get("version_exit", 0))
+elif command == "capabilities":
     print(json.dumps({"methods": config.get("methods", [])}))
 elif command == "list-windows":
     print(json.dumps(config.get("windows", [])))
@@ -80,6 +95,23 @@ else:
     sys.exit(2)
 '''
 
+FAKE_DEFAULTS = '''
+import json, os, plistlib, sys
+from pathlib import Path
+root = Path(os.environ["HOME"])
+with (root / "defaults-calls.jsonl").open("a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\\n")
+config = json.loads((root / "fake.json").read_text())
+if config.get("preferences_exit"):
+    print("Could not export preferences", file=sys.stderr)
+    sys.exit(1)
+if "preferences_output" in config:
+    sys.stdout.write(config["preferences_output"])
+else:
+    path = root / "preferences.plist"
+    sys.stdout.buffer.write(path.read_bytes() if path.exists() else plistlib.dumps({}))
+'''
+
 
 def snapshot(wsid="closed", cwd="/tmp/project", title="Project", agent=None):
     terminal = {"workingDirectory": cwd}
@@ -106,6 +138,9 @@ class CompatibilityTests(unittest.TestCase):
         fake = self.bin / "cmux"
         fake.write_text("#!" + sys.executable + "\n" + FAKE_CMUX)
         fake.chmod(0o755)
+        defaults = self.bin / "defaults"
+        defaults.write_text("#!" + sys.executable + "\n" + FAKE_DEFAULTS)
+        defaults.chmod(0o755)
         self.environment = mock.patch.dict(os.environ, {
             "HOME": str(self.home), "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
             "CMUX_WORKSPACE_ID": "test-workspace", "CMUX_SURFACE_ID": "test-surface"})
@@ -156,6 +191,676 @@ class CompatibilityTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(CLI)] + list(args),
                               capture_output=True, text=True, timeout=10)
 
+    @contextlib.contextmanager
+    def terminal_cli(self, *args):
+        master, slave = pty.openpty()
+        process = None
+        try:
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 90, 0, 0))
+            process = subprocess.Popen([sys.executable, str(CLI)] + list(args),
+                                       stdin=slave, stdout=slave, stderr=slave,
+                                       env={**os.environ, "TERM": "xterm-256color", "NO_COLOR": "1"},
+                                       preexec_fn=controlling_terminal)
+            os.close(slave)
+            slave = None
+            yield process, master
+        finally:
+            try:
+                if process is not None:
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=2)
+            finally:
+                os.close(master)
+                if slave is not None:
+                    os.close(slave)
+
+    def terminal_read(self, master, needle):
+        output, deadline = b"", time.monotonic() + 10
+        while needle not in output:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                break
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+        self.assertIn(needle, output)
+        return output
+
+    def terminal_wait(self, process, master):
+        # Drain curses' final repaint and terminal restoration before waiting;
+        # a PTY has a small output buffer and a blocked write cannot exit.
+        output, deadline = b"", time.monotonic() + 10
+        while process.poll() is None and time.monotonic() < deadline:
+            if select.select([master], [], [], 0.1)[0]:
+                try:
+                    output += os.read(master, 65536)
+                except OSError:
+                    break
+        return process.wait(timeout=1)
+
+    def close_event(self, wsid="closed", at=800000000, title="Project", cwd="/tmp/project"):
+        return {"category": "workspace", "workspace_id": wsid,
+                "id": f"close-{wsid}-{at}", "name": "workspace.closed",
+                "occurred_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                             time.gmtime(at + self.manager.APPLE_EPOCH)),
+                "payload": {"cwd": cwd, "custom_title": title}}
+
+    def deletion_tui_state(self):
+        st = self.settings_tui_state()
+        st.update(items=self.manager.entries(), q="", home=str(self.home),
+                  up="^", down="v", enter="enter", dot="-", dash="-",
+                  attr=dict.fromkeys(("hdr", "warn", "time", "meta", "title", "bar", "sel",
+                                      "num", "path", "badge"), 0))
+        return st
+
+    def settings(self, data, legacy=False, support=False):
+        path = self.home / ("Library/Application Support/com.cmuxterm.app/settings.json" if support else
+                            ".config/cmux/settings.json" if legacy else ".config/cmux/cmux.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(data if isinstance(data, str) else json.dumps(data))
+        return path
+
+    def preferences(self, data):
+        path = self.home / "preferences.plist"
+        path.write_bytes(plistlib.dumps(data))
+        return path
+
+    def settings_items(self):
+        report = self.manager.settings_report()
+        return report, {it["setting"]: it for it in report["items"]}
+
+    def settings_tui_state(self):
+        return {"items": [{"title": "repo", "cwd": "/tmp/repo", "group_name": ""}],
+                "sel": 0, "off": 0, "q": "repo", "mode": "list", "rows": 2,
+                "status": "", "pick": None, "show_all": False, "ell": "...", "ascii": False,
+                "mark": ">", "attr": {key: 0 for key in
+                ("hdr", "warn", "time", "meta", "title", "bar", "sel")}}
+
+    def test_settings_factory_values_and_explicit_defaults_are_omitted(self):
+        self.settings({"app": {"appearance": "system", "focusPaneOnFirstClick": False,
+                               "keepWorkspaceOpenWhenClosingLastSurface": False, "minimalMode": False},
+                       "sidebarAppearance": {"tintOpacity": 0.18},
+                       "shortcuts": {"bindings": {"newTab": "command+n", "sendFeedback": None}}})
+        self.preferences({"appearanceMode": "system", "paneFirstClickFocus.enabled": False,
+                          "closeWorkspaceOnLastSurfaceShortcut": True,
+                          "workspacePresentationMode": "standard", "sidebarTintOpacity": 0.18})
+        report, items = self.settings_items()
+        self.assertEqual(items, {})
+        self.assertTrue(report["complete"])
+        self.assertGreater(report["checked"], 250)
+        result = self.run_cli("settings", "diff")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("No differences among", result.stdout)
+
+    def test_settings_preferences_override_imported_file_values(self):
+        self.settings({"app": {"appearance": "dark"}, "sidebar": {"showPorts": False}})
+        self.preferences({"appearanceMode": "light", "sidebarShowPorts": True,
+                          "closeWorkspaceOnLastSurfaceShortcut": False,
+                          "workspacePresentationMode": "minimal", "sidebarBranchVerticalLayout": False,
+                          "fileExplorerDoubleClickAction": "defaultEditor", "agentConversationForkDefaultDestination": "left"})
+        report, items = self.settings_items()
+        self.assertTrue(report["complete"])
+        self.assertEqual(items["app.appearance"]["current"], "light")
+        self.assertEqual(items["app.appearance"]["source"], "macOS preferences")
+        self.assertNotIn("sidebar.showPorts", items)
+        self.assertTrue(items["app.keepWorkspaceOpenWhenClosingLastSurface"]["current"])
+        self.assertTrue(items["app.minimalMode"]["current"])
+        self.assertEqual(items["sidebar.branchLayout"]["current"], "inline")
+        self.assertEqual(items["fileExplorer.doubleClickAction"]["current"], "defaultEditor")
+        self.assertEqual(items["app.forkConversationDefaultDestination"]["current"], "left")
+
+    def test_settings_legacy_fallbacks_fill_only_missing_valid_keys(self):
+        self.settings({"app": {"appearance": "dark"}, "sidebar": {"showPorts": "wrong"}})
+        self.settings({"app": {"appearance": "light", "menuBarOnly": True},
+                       "sidebar": {"showPorts": False}}, legacy=True)
+        self.settings({"app": {"menuBarOnly": False, "minimalMode": True}}, support=True)
+        report, items = self.settings_items()
+        self.assertEqual(items["app.appearance"]["current"], "dark")
+        self.assertEqual(items["app.menuBarOnly"]["source"], "settings.json")
+        self.assertEqual(items["app.minimalMode"]["source"], "Application Support settings.json")
+        self.assertFalse(items["sidebar.showPorts"]["current"])
+        self.assertTrue(any("Invalid sidebar.showPorts" in n for n in report["notices"]))
+
+    def test_settings_jsonc_preserves_urls_escaped_quotes_and_comment_tokens(self):
+        command = 'editor "//not a comment" /*literal*/ ,] \\ path'
+        data = {"app": {"preferredEditor": command}, "browser": {"customSearchEngineURLTemplate":
+                "https://example.test/search?q={query}"}}
+        body = json.dumps(data)
+        text = "\ufeff/* settings */\n" + body[:-1] + ", // trailing comment\n}"
+        self.settings(text)
+        report, items = self.settings_items()
+        self.assertTrue(report["complete"], report["notices"])
+        self.assertEqual(items["app.preferredEditor"]["current"], command)
+        self.assertEqual(items["browser.customSearchEngineURLTemplate"]["current"],
+                         data["browser"]["customSearchEngineURLTemplate"])
+
+    def test_settings_invalid_primary_does_not_import_legacy_and_keeps_preferences(self):
+        self.settings('{"app": /* broken')
+        self.settings({"app": {"appearance": "dark"}}, legacy=True)
+        self.preferences({"notificationDockBadgeEnabled": False})
+        report, items = self.settings_items()
+        self.assertFalse(report["complete"])
+        self.assertNotIn("app.appearance", items)
+        self.assertIn("notifications.dockBadge", items)
+        self.assertTrue(any("Could not read cmux.json" in n for n in report["notices"]))
+
+    def test_settings_invalid_values_and_unrecognized_keys_are_not_differences(self):
+        self.settings({"app": {"appearance": "unknown", "menuBarOnly": 1, "unknown": "private-value"},
+                       "browser": {"defaultZoomLevel": True}, "sidebarAppearance": {"tintOpacity": 20}})
+        report, items = self.settings_items()
+        self.assertEqual(items, {})
+        self.assertFalse(report["complete"])
+        result = self.run_cli("settings", "diff")
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("private-value", result.stdout + result.stderr)
+        self.assertIn("Unsupported settings", result.stderr)
+
+    def test_settings_nonfinite_json_and_malformed_preferences_degrade(self):
+        self.settings('{"sidebarAppearance":{"tintOpacity":NaN}}')
+        self.configure(preferences_output="<?xml version='1.0'?><plist><dict>")
+        result = self.run_cli("settings", "diff")
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("Could not read", result.stderr)
+        self.assertNotIn("No differences among", result.stdout)
+
+    def test_settings_unsupported_version_and_build_never_claim_verified_defaults(self):
+        self.settings({"app": {"appearance": "dark"}})
+        for version in ("cmux 9.0.0", "cmux 0.64.25 (106) [abcdef012]"):
+            self.configure(version=version)
+            report, items = self.settings_items()
+            self.assertFalse(report["complete"])
+            self.assertEqual(report["checked"], 0)
+            self.assertFalse(items["app.appearance"]["verified"])
+            self.assertEqual(self.manager.setting_value(items["app.appearance"], True), "(unverified)")
+            result = self.run_cli("settings", "diff")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("(unverified)", result.stdout)
+
+    def test_settings_missing_cmux_marks_default_comparisons_unverified(self):
+        (self.bin / "cmux").unlink()
+        self.settings({"app": {"appearance": "dark"}})
+        with mock.patch.object(self.manager.shutil, "which", return_value=None), \
+                mock.patch.object(self.manager.subprocess, "run", side_effect=FileNotFoundError):
+            report = self.manager.settings_report()
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["changed"], 0)
+        self.assertFalse(report["items"][0]["verified"])
+
+    def test_settings_export_fallback_is_not_treated_as_live_preferences(self):
+        self.configure(preferences_exit=1)
+        path = self.home / "Library/Preferences/com.cmuxterm.app.plist"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(plistlib.dumps({"appearanceMode": "dark"}))
+        report, items = self.settings_items()
+        self.assertFalse(report["complete"])
+        self.assertFalse(items["app.appearance"]["verified"])
+        self.assertEqual(items["app.appearance"]["current"], "dark")
+
+    def test_settings_null_colors_and_cleared_imported_preferences(self):
+        self.settings({"notifications": {"paneFlashColor": "#abcdef"},
+                       "workspaceColors": {"selectionColor": None}})
+        self.preferences({"cmux.settingsFile.importedManagedDefaults.v1": json.dumps({
+            "notificationPaneFlashColorHex": {"nullableString": {"_0": "#ABCDEF"}}}).encode(),
+            "sidebarSelectionColorHex": ""})
+        report, items = self.settings_items()
+        self.assertTrue(report["complete"])
+        self.assertNotIn("notifications.paneFlashColor", items)
+        self.assertNotIn("workspaceColors.selectionColor", items)
+
+    def test_settings_pane_colors_and_supported_sidebar_paths(self):
+        self.settings({"paneBorderColor": "abcdef", "activePaneBorderColor": None,
+                       "sidebar": {"stackBranchDirectory": True, "pathLastSegmentOnly": True,
+                                   "beta": {"workspaceTodos": {"controls": {"enabled": True}}}}})
+        report, items = self.settings_items()
+        self.assertTrue(report["complete"], report["notices"])
+        self.assertEqual(items["paneBorderColor"]["current"], "#ABCDEF")
+        self.assertNotIn("activePaneBorderColor", items)
+        self.assertTrue(items["sidebar.stackBranchDirectory"]["current"])
+        self.assertTrue(items["sidebar.pathLastSegmentOnly"]["current"])
+        self.assertTrue(items["sidebar.beta.workspaceTodos.controls.enabled"]["current"])
+
+    def test_settings_widths_use_their_distinct_cmux_normalization(self):
+        self.preferences({"rightSidebarMaxWidth": 513.4, "terminal.sessionContentMaxWidth": 513.4})
+        report, items = self.settings_items()
+        self.assertTrue(report["complete"], report["notices"])
+        self.assertEqual(items["sidebar.rightMaxWidth"]["current"], 513)
+        self.assertEqual(items["terminal.sessionContentMaxWidth"]["current"], 520)
+
+    def test_settings_invalid_saved_preference_is_skipped_instead_of_using_file(self):
+        self.settings({"app": {"appearance": "dark"}})
+        self.preferences({"appearanceMode": {"invalid": "private-data"}})
+        report, items = self.settings_items()
+        self.assertFalse(report["complete"])
+        self.assertNotIn("app.appearance", items)
+        self.assertTrue(any("Invalid app.appearance in macOS preferences" in n for n in report["notices"]))
+
+    def test_settings_reset_palette_and_explicit_default_shortcut_aliases(self):
+        self.settings({"workspaceColors": {"colors": {"Red": "#112233"}},
+                       "shortcuts": {"bindings": {"browserBack": "cmd+leftbracket",
+                                                  "sendFeedback": ["none"]}}})
+        self.preferences({"cmux.settingsFile.importedManagedDefaults.v1": json.dumps({
+            "workspaceTabColor.colors": {"stringDictionary": {"_0": {"Red": "#112233"}}}}).encode()})
+        report, items = self.settings_items()
+        self.assertTrue(report["complete"], report["notices"])
+        self.assertEqual(items, {})
+
+    def test_settings_shortcuts_normalize_chords_and_explicit_unbinding(self):
+        self.settings({"shortcuts": {"bindings": {"newTab": ["control+b", "c"],
+            "openSettings": None, "sendFeedback": "none", "toggleSidebar": "command+b"}}})
+        self.preferences({"shortcut.newTab": json.dumps({"key": "x", "command": True,
+                          "shift": False, "option": False, "control": False}).encode()})
+        report, items = self.settings_items()
+        self.assertTrue(report["complete"], report["notices"])
+        self.assertEqual(items["shortcuts.bindings.newTab"]["current"], ["ctrl+b", "c"])
+        self.assertEqual(items["shortcuts.bindings.newTab"]["source"], "cmux.json")
+        self.assertIsNone(items["shortcuts.bindings.openSettings"]["current"])
+        self.assertEqual(self.manager.setting_value(items["shortcuts.bindings.openSettings"]), "(unbound)")
+        self.assertNotIn("shortcuts.bindings.sendFeedback", items)
+        self.assertNotIn("shortcuts.bindings.toggleSidebar", items)
+
+    def test_settings_saved_shortcuts_and_malformed_file_bindings(self):
+        self.preferences({"shortcut.newTab": json.dumps({"key": "b", "command": False,
+            "shift": False, "option": False, "control": True, "chordKey": "c"}).encode(),
+            "shortcut.simulatorRotateLeft": json.dumps({"key": "←", "command": True,
+                "shift": False, "option": False, "control": False}).encode()})
+        report, items = self.settings_items()
+        self.assertEqual(items["shortcuts.bindings.newTab"]["current"], ["ctrl+b", "c"])
+        self.assertNotIn("shortcuts.bindings.simulatorRotateLeft", items)
+        self.settings({"shortcuts": {"bindings": {"newTab": ["", "c"], "notAnAction": "cmd+x"}}})
+        report, items = self.settings_items()
+        self.assertFalse(report["complete"])
+        self.assertNotIn("shortcuts.bindings.newTab", items)
+        self.assertTrue(any("Invalid shortcut binding" in n for n in report["notices"]))
+
+    def test_settings_context_dependent_defaults_are_explicitly_unverified(self):
+        self.settings({"shortcuts": {"bindings": {"switchRightSidebarToFiles": "ctrl+5"},
+                                    "when": {"newTab": "terminalFocus"}}})
+        report, items = self.settings_items()
+        self.assertEqual(report["unverified"], 2)
+        self.assertFalse(items["shortcuts.bindings.switchRightSidebarToFiles"]["verified"])
+        self.assertFalse(items["shortcuts.when.newTab"]["verified"])
+
+    def test_settings_command_is_read_only_and_does_not_harvest_history(self):
+        config = self.settings({"app": {"appearance": "dark"},
+                                "automation": {"socketPassword": "secret-password"},
+                                "commands": {"private": "secret-command"}})
+        prefs = self.preferences({"cmux.auth.token": "secret-token", "NSWindow Frame": "private-state"})
+        native = self.native([closed(snapshot())])
+        events = self.events([{"category": "workspace", "id": "closed", "workspace_id": "ws",
+                              "name": "workspace.closed", "payload": {"private": "secret-event"}}])
+        before = {path: path.read_bytes() for path in (config, prefs, native, events)}
+        result = self.run_cli("settings", "diff")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Setting", result.stdout)
+        self.assertEqual(self.calls(), [["--version"]])
+        self.assertFalse(Path(self.manager.HISTORY).exists())
+        self.assertFalse(Path(self.manager.GROUPS).exists())
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content)
+        for value in ("secret-password", "secret-command", "secret-token", "private-state", "secret-event"):
+            self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_settings_help_and_invalid_arguments_never_load_settings_or_history(self):
+        for args in (("settings", "diff", "--help"), ("settings", "-h")):
+            result = self.run_cli(*args)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("settings diff", result.stdout)
+        for args in (("settings",), ("settings", "other"), ("settings", "diff", "--all"),
+                     ("--no-interactive", "settings", "diff"), ("settings", "diff", "--unknown")):
+            result = self.run_cli(*args)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--help", result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.home / "defaults-calls.jsonl").exists())
+
+    def test_settings_external_reads_have_timeouts(self):
+        with mock.patch.object(self.manager.subprocess, "run", side_effect=subprocess.TimeoutExpired("read", 3)) as run:
+            report = self.manager.settings_report()
+        self.assertFalse(report["complete"])
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs["timeout"], 3)
+            self.assertIsInstance(call.args[0], list)
+
+    def test_settings_tui_preserves_workspaces_and_never_reopens_from_settings(self):
+        st = self.settings_tui_state()
+        report = {"items": [{"setting": "app.appearance", "current": "dark", "default": "system",
+                            "source": "cmux.json", "verified": True}], "complete": True,
+                  "version": "0.64.25", "changed": 1, "unverified": 0, "checked": 319, "notices": []}
+        original = {key: st[key] for key in ("items", "sel", "off", "q", "mode", "pick")}
+        with mock.patch.object(self.manager, "settings_report", return_value=report) as load, \
+                mock.patch.object(self.manager, "tui_settings_draw"), \
+                mock.patch.object(self.manager.curses, "flushinp"), \
+                mock.patch.object(self.manager, "entries", side_effect=AssertionError("history read")), \
+                mock.patch.object(self.manager, "do_reopen", side_effect=AssertionError("reopen")):
+            self.assertFalse(self.manager.tui_key(None, st, "s"))
+            self.assertEqual(st["screen"], "settings")
+            self.assertFalse(self.manager.tui_key(None, st, 10))
+            self.assertEqual(st["settings"]["detail"]["setting"], "app.appearance")
+            self.assertFalse(self.manager.tui_key(None, st, 27))
+            self.assertIsNone(st["settings"]["detail"])
+            self.assertFalse(self.manager.tui_key(None, st, "/"))
+            for key in "DARK": self.manager.tui_key(None, st, key)
+            self.manager.tui_key(None, st, 10)
+            self.assertEqual(len(self.manager.settings_visible(st["settings"])), 1)
+            self.manager.tui_key(None, st, "r")
+            self.assertEqual(load.call_count, 2)
+            self.assertEqual(st["settings"]["q"], "DARK")
+            self.manager.tui_key(None, st, 27)
+            self.assertEqual(st["screen"], "settings")
+            self.manager.tui_key(None, st, 27)
+            self.assertEqual(st["screen"], "workspaces")
+        self.assertEqual({key: st[key] for key in original}, original)
+
+    def test_settings_tui_loading_drawing_details_and_small_terminals(self):
+        st = self.settings_tui_state()
+        st["screen"] = "settings"
+        self.settings({"app": {"preferredEditor": "editor " + "界" * 70 + "\n\x1b\u202e"}})
+        window = mock.Mock()
+        window.getmaxyx.return_value = (14, 90)
+        with mock.patch.object(self.manager, "put") as put, \
+                mock.patch.object(self.manager.curses, "flushinp"), \
+                mock.patch.object(self.manager.curses, "ACS_HLINE", ord("-"), create=True):
+            self.manager.tui_settings_load(window, st)
+            self.manager.tui_settings_draw(window, st)
+            self.manager.tui_key(window, st, 10)
+            self.manager.tui_settings_draw(window, st)
+            lines = self.manager.settings_detail_lines(st, 40)
+            self.assertGreater(len(lines), 10)
+            self.assertTrue(all(self.manager.dwidth(line) <= 40 for line in lines))
+            self.manager.tui_key(window, st, "i")
+            self.manager.tui_settings_draw(window, st)
+            for text in (call.args[3] for call in put.call_args_list):
+                for control in ("\n", "\x1b", "\u202e"):
+                    self.assertNotIn(control, text)
+            window.getmaxyx.return_value = (5, 20)
+            self.manager.tui_settings_draw(window, st)
+            self.assertIn("window too small", put.call_args_list[-1].args)
+
+    def test_delete_merges_all_past_closes_and_preserves_sources_and_neighbor_titles(self):
+        native = self.native([closed(snapshot("old", agent="claude")),
+                              closed(snapshot("new"), 800000200),
+                              closed(snapshot("neighbor", title="Other"), 800000300)])
+        records = [self.close_event("event-only", 799999900),
+                   self.close_event("old", title=""), self.close_event("new", 800000200, title="")]
+        events = self.events(records)
+        before = {path: path.read_bytes() for path in (native, events)}
+        item = next(it for it in self.manager.entries() if it["title"] == "Project")
+        self.assertIsNone(self.manager.delete_entry(item))
+        for show_all in (False, True):
+            self.assertEqual([it["id"] for it in self.manager.entries(show_all)], ["neighbor"])
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        saved = json.loads(Path(self.manager.DELETIONS).read_text())["records"][0]
+        self.assertEqual(saved["ids"], ["event-only", "new", "old"])
+        self.assertNotIn("snapshot", saved)
+        self.assertNotIn("session-123", Path(self.manager.DELETIONS).read_text())
+        self.assertNotIn("Project", self.run_cli("--no-interactive").stdout)
+        self.assertNotIn("Project", self.run_cli("--all", "--no-interactive").stdout)
+        # Native retention must not reveal the title-less event fallback.
+        self.native([])
+        self.assertEqual(self.manager.entries(), [])
+
+    def test_deleted_snapshots_never_graft_into_a_later_close(self):
+        donor = closed(snapshot("old", agent="claude"))
+        self.native([donor, closed(snapshot("new"), 800000100)])
+        self.assertTrue(self.manager.entries()[0]["grafted"])
+        self.assertIsNone(self.manager.delete_entry(self.manager.entries()[0]))
+        self.native([donor, closed(snapshot("later"), 800000200)])
+        item, = self.manager.entries()
+        self.assertEqual(item["id"], "later")
+        self.assertNotIn("grafted", item)
+        self.assertEqual(self.manager.restore_counts(item["snapshot"]), (1, 0, 0))
+        self.assertEqual([it["id"] for it in self.manager.entries(True)], ["later"])
+
+    def test_delete_event_only_history_and_allow_same_id_to_close_later(self):
+        old, newest = self.close_event(), self.close_event(at=800000200)
+        created = dict(self.close_event(at=800000100), name="workspace.created", id="created")
+        records = [old, created, newest, self.close_event("neighbor", title="Other")]
+        source = self.events(records)
+        before = source.read_bytes()
+        item = next(it for it in self.manager.entries() if it["id"] == "closed")
+        self.assertIsNone(self.manager.delete_entry(item))
+        self.assertEqual([it["id"] for it in self.manager.entries(True)], ["neighbor"])
+        self.assertEqual(source.read_bytes(), before)
+        self.events(records + [self.close_event(at=800000300)])
+        self.assertEqual([it["id"] for it in self.manager.entries()], ["closed", "neighbor"])
+
+    def test_delete_from_all_view_removes_newer_and_older_closes(self):
+        self.native([closed(snapshot("old")), closed(snapshot("new"), 800000300),
+                     closed(snapshot("neighbor", title="Other"), 800000100)])
+        raw = self.manager.entries(True)
+        self.assertEqual(len(raw), 3)
+        self.assertIsNone(self.manager.delete_entry(next(it for it in raw if it["id"] == "old")))
+        self.assertEqual([it["id"] for it in self.manager.entries(True)], ["neighbor"])
+
+    def test_delete_individual_workspace_from_closed_window(self):
+        record = {"closedAt": 800000000, "entry": {"window": {"_0": {
+            "workspaceIds": ["first", "second"], "snapshot": {"tabManager": {
+                "workspaces": [snapshot("first"), snapshot("second", title="Other")]}}}}}}
+        source = self.native([record], legacy=True)
+        before = source.read_bytes()
+        self.assertIsNone(self.manager.delete_entry(self.manager.entries()[0]))
+        self.assertEqual([it["id"] for it in self.manager.entries()], ["second"])
+        self.assertEqual(source.read_bytes(), before)
+
+    def test_delete_untitled_and_directoryless_entries_use_existing_identity(self):
+        self.native([closed(snapshot("untitled-old", title="")),
+                     closed(snapshot("untitled-new", title=""), 800000100),
+                     closed(snapshot("named", title="Other")),
+                     closed(snapshot("no-dir", cwd="", title="")),
+                     closed(snapshot("no-dir", cwd="", title=""), 800000300),
+                     closed(snapshot("different-id", cwd="", title=""), 800000200)])
+        items = self.manager.entries()
+        self.assertIsNone(self.manager.delete_entry(next(it for it in items if it["id"] == "untitled-new")))
+        self.assertIsNone(self.manager.delete_entry(next(it for it in items if it["id"] == "no-dir")))
+        self.assertEqual({it["id"] for it in self.manager.entries(True)}, {"named", "different-id"})
+
+    def test_malformed_removal_records_are_skipped_and_preserved_on_save(self):
+        self.native([closed(snapshot()), closed(snapshot("neighbor", title="Other"), 800000100)])
+        path = Path(self.manager.DELETIONS)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        bad = [None, [], {"identity": ["/tmp/project"], "before": 800000000},
+               {"identity": ["/tmp/project", "project"], "before": "invalid"},
+               {"identity": [[], "project"], "before": 800000000}]
+        path.write_text(json.dumps({"version": 1, "records": bad}))
+        self.assertEqual(len(self.manager.entries()), 2)
+        self.assertIsNone(self.manager.delete_entry(self.manager.entries()[0]))
+        self.assertEqual(json.loads(path.read_text())["records"][:-1], bad)
+        self.assertEqual([it["id"] for it in self.manager.entries()], ["closed"])
+        for invalid in ('{"version": 2, "records": []}', '{"version": 1, "records": {}}', '{broken'):
+            path.write_text(invalid)
+            self.assertEqual(len(self.manager.entries()), 2)
+            self.assertIn("Could not save removal", self.manager.delete_entry(self.manager.entries()[0]))
+            self.assertEqual(path.read_text(), invalid)
+
+    def test_failed_atomic_removal_write_keeps_existing_removals_and_sources(self):
+        native = self.native([closed(snapshot()),
+                              closed(snapshot("neighbor", title="Other"), 800000100)])
+        events = self.events([self.close_event()])
+        self.assertIsNone(self.manager.delete_entry(self.manager.entries()[0]))
+        saved = Path(self.manager.DELETIONS)
+        before = {path: path.read_bytes() for path in (native, events, saved)}
+        with mock.patch.object(self.manager.os, "replace", side_effect=PermissionError):
+            self.assertIn("PermissionError", self.manager.delete_entry(self.manager.entries()[0]))
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertEqual([it["id"] for it in self.manager.entries()], ["closed"])
+        self.assertFalse(list(saved.parent.glob(".workspace-deletions-*")))
+
+    def test_delete_tui_requires_exact_confirmation_and_preserves_filtered_position(self):
+        self.native([closed(snapshot("one", title="Project one"), 800000300),
+                     closed(snapshot("two", title="Project two"), 800000200),
+                     closed(snapshot("three", title="Project three"), 800000100),
+                     closed(snapshot("neighbor", title="Other"), 800000400)])
+        st = self.deletion_tui_state()
+        st.update(q="Project ", sel=1, off=1)
+        window = mock.Mock()
+        window.getmaxyx.return_value = (24, 90)
+        original = list(st["items"])
+        with mock.patch.object(self.manager, "tui_draw"), \
+                mock.patch.object(self.manager.curses, "flushinp"), \
+                mock.patch.object(self.manager, "delete_entry", wraps=self.manager.delete_entry) as delete:
+            self.assertFalse(self.manager.tui_key(window, st, "d"))
+            self.assertEqual(st["delete"]["item"]["id"], "two")
+            for text in ("", "yes", "YES ", " YES", "YESx"):
+                self.manager.tui_key(window, st, 21)
+                for key in text:
+                    self.manager.tui_key(window, st, key)
+                self.manager.tui_key(window, st, 10)
+                self.assertIn("exactly", st["delete"]["error"])
+                delete.assert_not_called()
+                self.assertEqual(st["items"], original)
+            self.manager.tui_key(window, st, 21)
+            for key in "qsr/":
+                self.assertFalse(self.manager.tui_key(window, st, key))
+            self.assertEqual(st["delete"]["text"], "qsr/")
+            self.manager.tui_key(window, st, self.manager.curses.KEY_DOWN)
+            self.assertEqual(st["sel"], 1)
+            self.manager.tui_key(window, st, 21)
+            for key in "YESx":
+                self.manager.tui_key(window, st, key)
+            self.manager.tui_key(window, st, 127)
+            window.getmaxyx.return_value = (5, 20)
+            self.manager.tui_key(window, st, 10)
+            delete.assert_not_called()
+            self.manager.tui_key(window, st, self.manager.curses.KEY_RESIZE)
+            self.assertEqual(st["delete"]["text"], "YES")
+            self.assertEqual(st["delete"]["item"]["id"], "two")
+            window.getmaxyx.return_value = (24, 90)
+            self.assertFalse(self.manager.tui_key(window, st, 10))
+            delete.assert_called_once()
+        self.assertIsNone(st["delete"])
+        self.assertIsNone(st["pick"])
+        self.assertEqual(st["q"], "Project ")
+        self.assertEqual([it["id"] for it in self.manager.visible(st)], ["one", "three"])
+        self.assertEqual((st["sel"], st["off"]), (1, 0))
+
+    def test_delete_tui_cancellation_failure_search_and_empty_list(self):
+        self.native([closed(snapshot())])
+        window = mock.Mock()
+        window.getmaxyx.return_value = (24, 90)
+        for key in (27, 3):
+            st = self.deletion_tui_state()
+            original = {k: st[k] for k in ("items", "sel", "off", "q", "pick")}
+            self.manager.tui_key(window, st, "d")
+            for char in "YES":
+                self.manager.tui_key(window, st, char)
+            self.assertFalse(Path(self.manager.DELETIONS).exists())
+            self.assertFalse(self.manager.tui_key(window, st, key))
+            self.assertIsNone(st["delete"])
+            self.assertEqual({k: st[k] for k in original}, original)
+        st = self.deletion_tui_state()
+        self.manager.tui_key(window, st, "d")
+        st["delete"]["text"] = "YES"
+        with mock.patch.object(self.manager, "delete_entry", return_value="Could not save removal."):
+            self.manager.tui_key(window, st, 10)
+        self.assertIn("Could not save", st["delete"]["error"])
+        self.assertEqual(len(st["items"]), 1)
+        self.manager.tui_key(window, st, 27)
+        st["mode"] = "search"
+        self.manager.tui_key(window, st, "d")
+        self.assertEqual(st["q"], "d")
+        self.assertIsNone(st["delete"])
+        st.update(mode="list", q="", items=[])
+        self.manager.tui_key(window, st, "d")
+        self.assertIsNone(st["delete"])
+        self.assertIn("No closed workspace", st["status"])
+
+    def test_delete_dialog_sanitizes_labels_and_draws_in_small_and_ascii_terminals(self):
+        st = self.settings_tui_state()
+        item = {"title": "界\n\x1b\u202e" * 80, "cwd": "/tmp/\n\x1b\u202e" * 40}
+        st["delete"] = {"item": item, "text": "YES", "error": ""}
+        window = mock.Mock()
+        window.getmaxyx.return_value = (24, 90)
+        with mock.patch.object(self.manager.curses, "newwin", return_value=window), \
+                mock.patch.object(self.manager.curses, "curs_set"), \
+                mock.patch.object(self.manager, "put") as put:
+            for ascii_only in (False, True):
+                st["ascii"] = ascii_only
+                self.manager.tui_delete_draw(window, st)
+                for call in put.call_args_list:
+                    for control in ("\n", "\x1b", "\u202e"):
+                        self.assertNotIn(control, call.args[3])
+                    self.assertLessEqual(self.manager.dwidth(call.args[3]), call.args[4])
+                put.reset_mock()
+            window.getmaxyx.return_value = (5, 20)
+            self.manager.tui_delete_draw(window, st)
+            self.assertIn("Resize terminal", put.call_args.args[3])
+
+    def test_cli_delete_requires_a_terminal_and_rejects_invalid_arguments(self):
+        self.native([closed(snapshot())])
+        result = subprocess.run([sys.executable, str(CLI), "delete", "1"], input="YES\n",
+                                capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("interactive terminal", result.stderr)
+        for args in (("delete",), ("delete", "0"), ("delete", "x"),
+                     ("delete", "1", "extra"), ("delete", "1", "--plain"),
+                     ("delete", "1", "--no-interactive"), ("delete", "1", "--yes")):
+            result = self.run_cli(*args)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--help", result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(Path(self.manager.DELETIONS).exists())
+        with self.terminal_cli("delete", "9") as (process, master):
+            self.terminal_read(master, b"--help")
+            self.assertNotEqual(process.wait(timeout=10), 0)
+        self.assertFalse(Path(self.manager.DELETIONS).exists())
+
+    def test_cli_delete_uses_default_numbering_and_exact_typed_confirmation(self):
+        self.native([closed(snapshot("new"), 800000300), closed(snapshot("old"), 800000200),
+                     closed(snapshot("neighbor", title="Other"), 800000100)])
+        with self.terminal_cli("--all", "delete", "2") as (process, master):
+            output = self.terminal_read(master, b"Ctrl+C to cancel): ")
+            self.assertIn(b"Workspace: Other", output)
+            self.assertFalse(Path(self.manager.DELETIONS).exists())
+            os.write(master, b"yes\nYES \n YES\n\nYES\n")
+            output = self.terminal_read(master, b"Removed workspace history from this tool.")
+            self.assertEqual(output.count(b"Type YES exactly"), 4)
+            self.assertEqual(process.wait(timeout=10), 0)
+        self.assertEqual([it["id"] for it in self.manager.entries()], ["new"])
+        self.assertEqual({it["id"] for it in self.manager.entries(True)}, {"new", "old"})
+        self.assertFalse(any(call[0] == "new-workspace" for call in self.calls()))
+
+    def test_cli_delete_ctrl_c_and_eof_cancel(self):
+        self.native([closed(snapshot())])
+        for key in (b"\x03", b"\x04"):
+            with self.terminal_cli("delete", "1") as (process, master):
+                self.terminal_read(master, b"Ctrl+C to cancel): ")
+                os.write(master, key)
+                self.terminal_read(master, b"Deletion cancelled.")
+                self.assertNotEqual(process.wait(timeout=10), 0)
+            self.assertFalse(Path(self.manager.DELETIONS).exists())
+
+    def test_real_curses_delete_dialog_cancel_confirm_and_continue(self):
+        self.native([closed(snapshot())])
+        with self.terminal_cli() as (process, master):
+            self.terminal_read(master, b"Project")
+            os.write(master, b"d")
+            self.terminal_read(master, b"Are you sure?")
+            os.write(master, b"\x03")
+            self.terminal_read(master, b"Deletion cancelled.")
+            self.assertIsNone(process.poll())
+            self.assertFalse(Path(self.manager.DELETIONS).exists())
+            os.write(master, b"d")
+            self.terminal_read(master, b"Are you sure?")
+            os.write(master, b"YES")
+            self.assertFalse(Path(self.manager.DELETIONS).exists())
+            os.write(master, b"\n")
+            self.terminal_read(master, b"Removed workspace history from this tool.")
+            self.assertIsNone(process.poll())
+            os.write(master, b"q")
+            self.assertEqual(self.terminal_wait(process, master), 0)
+        self.assertEqual(self.manager.entries(), [])
+        self.assertFalse(any(call[0] == "new-workspace" for call in self.calls()))
+
     def test_help_never_reads_history_or_invokes_cmux(self):
         self.events([{"category": "workspace", "id": "event", "workspace_id": "ws",
                       "name": "workspace.closed"}])
@@ -167,6 +872,7 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(self.calls(), [])
         self.assertFalse(Path(self.manager.HISTORY).exists())
         self.assertFalse(Path(self.manager.GROUPS).exists())
+        self.assertFalse(Path(self.manager.DELETIONS).exists())
 
     def test_unknown_option_is_a_usage_error(self):
         result = self.run_cli("--unknown")
