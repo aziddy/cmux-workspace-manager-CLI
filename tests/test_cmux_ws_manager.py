@@ -505,6 +505,7 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(self.calls(), [["--version"]])
         self.assertFalse(Path(self.manager.HISTORY).exists())
         self.assertFalse(Path(self.manager.GROUPS).exists())
+        self.assertFalse(Path(self.manager.SNAPSHOTS).exists())
         for path, content in before.items():
             self.assertEqual(path.read_bytes(), content)
         for value in ("secret-password", "secret-command", "secret-token", "private-state", "secret-event"):
@@ -605,9 +606,10 @@ class CompatibilityTests(unittest.TestCase):
         self.assertNotIn("session-123", Path(self.manager.DELETIONS).read_text())
         self.assertNotIn("Project", self.run_cli("--no-interactive").stdout)
         self.assertNotIn("Project", self.run_cli("--all", "--no-interactive").stdout)
-        # Native retention must not reveal the title-less event fallback.
+        # Native retention must not reveal the title-less event fallback;
+        # the undeleted neighbor survives in the snapshot archive.
         self.native([])
-        self.assertEqual(self.manager.entries(), [])
+        self.assertEqual([it["id"] for it in self.manager.entries()], ["neighbor"])
 
     def test_deleted_snapshots_never_graft_into_a_later_close(self):
         donor = closed(snapshot("old", agent="claude"))
@@ -861,7 +863,25 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(self.manager.entries(), [])
         self.assertFalse(any(call[0] == "new-workspace" for call in self.calls()))
 
+    def test_ctrl_c_during_delete_dialog_repaint_cancels_without_exiting(self):
+        self.native([closed(snapshot())])
+        st = self.deletion_tui_state()
+        window = mock.Mock()
+        self.manager.tui_key(window, st, "d")
+        with mock.patch.object(self.manager.curses, "set_escdelay"), \
+                mock.patch.object(self.manager.curses, "curs_set"), \
+                mock.patch.object(self.manager, "tui_colors", return_value={}), \
+                mock.patch.object(self.manager, "tui_load"), \
+                mock.patch.object(self.manager, "tui_draw", side_effect=[KeyboardInterrupt, None]), \
+                mock.patch.object(self.manager, "read_key", return_value="q") as read:
+            self.manager.tui_main(window, st)
+        self.assertIsNone(st["delete"])
+        self.assertEqual(st["status"], "Deletion cancelled.")
+        read.assert_called_once()  # the loop stayed open until the later q key
+        self.assertFalse(Path(self.manager.DELETIONS).exists())
+
     def test_help_never_reads_history_or_invokes_cmux(self):
+        self.native([closed(snapshot())])
         self.events([{"category": "workspace", "id": "event", "workspace_id": "ws",
                       "name": "workspace.closed"}])
         for flag in ("-h", "--help"):
@@ -873,6 +893,7 @@ class CompatibilityTests(unittest.TestCase):
         self.assertFalse(Path(self.manager.HISTORY).exists())
         self.assertFalse(Path(self.manager.GROUPS).exists())
         self.assertFalse(Path(self.manager.DELETIONS).exists())
+        self.assertFalse(Path(self.manager.SNAPSHOTS).exists())
 
     def test_unknown_option_is_a_usage_error(self):
         result = self.run_cli("--unknown")
@@ -907,6 +928,548 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["snapshot"], snap)
         self.assertEqual(path.read_bytes(), original)
+
+    def test_archived_layout_reopens_after_native_history_eviction(self):
+        snap = snapshot(agent="codex")
+        snap["panels"].append({"id": "web", "browser": {"urlString": "https://example.com"}})
+        snap["layout"] = {"type": "split", "split": {"orientation": "horizontal",
+            "first": snap["layout"], "second": {"type": "pane", "pane": {"panelIds": ["web"]}}}}
+        native = self.native([closed(snap)])
+        events = self.events([self.close_event()])
+        before = {p: p.read_bytes() for p in (native, events)}
+        self.assertEqual(self.run_cli("--no-interactive").returncode, 0)
+        self.assertEqual({p: p.read_bytes() for p in before}, before)
+        archive = Path(self.manager.SNAPSHOTS)
+        saved = archive.read_bytes()
+        self.assertEqual(archive.stat().st_mode & 0o777, 0o600)
+        # cmux's shared cap can evict every workspace while keeping panel closes.
+        self.native([{"closedAt": 800000100, "entry": {"panel": {"snapshot": {}}}}])
+        for show_all in (False, True):
+            item, = self.manager.entries(show_all)
+            self.assertEqual(item["snapshot"], snap)
+            self.assertEqual(self.manager.restore_counts(item["snapshot"]), (0, 1, 1))
+        for flags in ([], ["--plain"]):
+            result = self.run_cli("reopen", "1", *flags)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            cmd = [c for c in self.calls() if c[0] == "new-workspace"][-1]
+            self.assertEqual("--layout" in cmd, not flags)
+            if not flags:
+                self.assertEqual(json.loads(cmd[cmd.index("--layout") + 1]),
+                                 self.manager.build_layout(snap))
+        before_calls = len(self.calls())
+        self.assertNotEqual(self.run_cli("reopen", "2").returncode, 0)
+        self.assertFalse(any(c[0] == "new-workspace" for c in self.calls()[before_calls:]))
+        self.assertEqual(archive.read_bytes(), saved)
+
+    def test_snapshots_are_archived_before_open_workspace_filtering(self):
+        snap = snapshot()
+        self.native([closed(snap)])
+        self.configure(workspaces={"current": [{"id": "closed", "current_directory": "/tmp/project"}]})
+        self.assertEqual(self.manager.entries(), [])
+        self.native([])
+        self.configure()
+        item, = self.manager.entries()
+        self.assertEqual(item["snapshot"], snap)
+
+    def test_archive_keeps_window_snapshots_and_their_historical_group_names(self):
+        snaps = [dict(snapshot("first"), groupId=GROUP_A), snapshot("second", "/tmp/second")]
+        self.native([{"closedAt": 800000000, "entry": {"window": {"_0": {"snapshot": {
+            "tabManager": {"workspaces": snaps,
+                           "workspaceGroups": [{"id": GROUP_A, "name": "Saved group"}]}}}}}}])
+        self.manager.entries()
+        self.native([])
+        Path(self.manager.GROUPS).unlink()
+        items = self.manager.entries()
+        self.assertEqual({it["id"] for it in items}, {"first", "second"})
+        self.assertEqual(next(it for it in items if it["id"] == "first")["group_name"], "Saved group")
+
+    def test_native_snapshot_updates_archived_copy_without_duplicate_rows(self):
+        self.native([closed(snapshot())])
+        self.manager.entries()
+        latest = snapshot(agent="claude")
+        self.native([closed(latest)])
+        self.assertEqual(self.manager.entries()[0]["snapshot"], latest)
+        saved = Path(self.manager.SNAPSHOTS).read_bytes()
+        self.manager.entries()
+        self.assertEqual(Path(self.manager.SNAPSHOTS).read_bytes(), saved)
+        self.native([])
+        item, = self.manager.entries(True)
+        self.assertEqual(item["snapshot"], latest)
+
+    def test_concurrent_archiving_deduplicates_same_close(self):
+        self.native([closed(snapshot())])
+        code = ("import importlib.machinery; "
+                f"m = importlib.machinery.SourceFileLoader('archive_test', {str(CLI)!r}).load_module(); "
+                "m.closed_history()")
+        processes = [subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE) for _ in range(3)]
+        try:
+            for process in processes:
+                out, err = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, err)
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+        records = Path(self.manager.SNAPSHOTS).read_text().splitlines()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(self.manager.closed_history()), 1)
+
+    def test_malformed_archive_records_and_partial_tail_preserve_readable_snapshots(self):
+        self.native([closed(snapshot("older", title="Older"))])
+        self.manager.entries()
+        archive = Path(self.manager.SNAPSHOTS)
+        good = archive.read_bytes()
+        with archive.open("a") as f:
+            for record in (None, [], {"version": True},
+                           {"version": 1, "ts": "bad", "snapshot": {}},
+                           {"version": 1, "ts": 1, "snapshot": []}):
+                f.write(json.dumps(record) + "\n")
+            f.write('{"version": 1, "snapshot":')
+        self.native([closed(snapshot("newer", title="Newer"), 800000100)])
+        notices = []
+        self.assertEqual({it["id"] for it in self.manager.entries(notices=notices)}, {"older", "newer"})
+        self.assertIn("Skipped malformed", " ".join(notices))
+        self.assertTrue(archive.read_bytes().startswith(good))
+        self.assertEqual(len(archive.read_text().splitlines()), 2)
+        self.native([])
+        self.assertEqual({it["id"] for it in self.manager.entries()}, {"older", "newer"})
+
+    def test_unwritable_archive_warns_but_keeps_native_and_readable_saved_snapshots(self):
+        self.native([closed(snapshot("older", title="Older"))])
+        self.manager.entries()
+        saved = Path(self.manager.SNAPSHOTS).read_bytes()
+        self.native([closed(snapshot("newer", title="Newer"), 800000100)])
+        notices = []
+        with mock.patch.object(self.manager.os, "open", side_effect=PermissionError):
+            items = self.manager.closed_history(notices=notices)
+        self.assertEqual({it["id"] for it in items}, {"older", "newer"})
+        self.assertIn("Could not save workspace snapshots", " ".join(notices))
+        self.assertEqual(Path(self.manager.SNAPSHOTS).read_bytes(), saved)
+
+    def test_unreadable_archive_does_not_hide_event_history(self):
+        self.events([self.close_event()])
+        Path(self.manager.SNAPSHOTS).mkdir()
+        notices = []
+        self.assertEqual(len(self.manager.entries(notices=notices)), 1)
+        self.assertIn("Could not save workspace snapshots", " ".join(notices))
+
+    def test_archive_flush_failure_warns_and_malformed_snapshot_does_not_block_others(self):
+        self.native([closed(snapshot("saved", title="Saved"))])
+        self.manager.closed_history()
+        original = Path(self.manager.SNAPSHOTS).read_bytes()
+        bad = dict(snapshot("bad", title="Bad"), unknown=float("nan"))
+        self.native([closed(bad), closed(snapshot("good", title="Good"), 800000100)])
+        notices = []
+        with mock.patch.object(self.manager.os, "fsync", side_effect=OSError):
+            items = self.manager.closed_history(notices=notices)
+        self.assertEqual({it["id"] for it in items}, {"bad", "good", "saved"})
+        self.assertIn("malformed workspace snapshot", " ".join(notices))
+        self.assertIn("Could not save workspace snapshots", " ".join(notices))
+        self.assertEqual(Path(self.manager.SNAPSHOTS).read_bytes(), original)
+        self.assertEqual(list(Path(self.manager.LOG_DIR).glob(".workspace-*")), [])
+        self.manager.closed_history(notices=[])
+        self.native([])
+        self.assertEqual({it["id"] for it in self.manager.entries()}, {"good", "saved"})
+
+    def saved_snapshots(self):
+        return list(self.manager.archive_inventory()[0].values())
+
+    def test_retention_deduplicates_equivalent_layouts_across_regenerated_ids(self):
+        records = []
+        for i in range(30):
+            snap = snapshot(str(i), agent="codex")
+            snap["panels"][0]["id"] = f"panel-{i}"
+            snap["panels"][0]["terminal"]["scrollback"] = str(i)
+            snap["layout"]["pane"]["panelIds"] = [f"panel-{i}"]
+            records.append(closed(snap, 800000000 + i))
+        self.native(records)
+        self.manager.closed_history()
+        saved, = self.saved_snapshots()
+        self.assertEqual(saved["id"], "29")
+        self.assertEqual(len(self.manager.closed_history()), 30)  # native history stays raw
+
+    def test_retention_preserves_changed_restorable_content(self):
+        base = snapshot(agent="codex")
+        base["panels"].append({"id": "web", "browser": {"urlString": "https://example.com/a"}})
+        base["layout"]["pane"]["panelIds"].append("web")
+        original = self.manager.checkpoint_info(self.manager.closed_snapshot(base, "id", 1))[0]
+        for field in ("url", "cwd", "session", "color", "group", "name"):
+            snap = json.loads(json.dumps(base))
+            if field == "url":
+                snap["panels"][1]["browser"]["urlString"] += "/b"
+            elif field == "cwd":
+                snap["panels"][0]["terminal"]["workingDirectory"] = "/tmp/changed"
+            elif field == "session":
+                snap["panels"][0]["terminal"]["agent"]["sessionId"] = "other"
+            elif field == "color":
+                snap["customColor"] = "#123456"
+            elif field == "group":
+                snap["groupId"] = GROUP_A
+            else:
+                snap["panels"][0]["customTitle"] = "Changed"
+            self.assertNotEqual(original, self.manager.checkpoint_info(
+                self.manager.closed_snapshot(snap, "id", 1))[0], field)
+
+    def test_retention_spreads_checkpoints_and_caps_at_five_under_churn(self):
+        now = 800000000
+        ages = [40 * 86400, 31 * 86400, 8 * 86400, 2 * 86400] + list(range(120, -1, -1))
+        for age in ages:  # sequential collections, including native eviction
+            snap = dict(snapshot(str(age)), customColor=f"#{age:06x}")
+            self.native([closed(snap, now - age)])
+            self.manager.closed_history()
+            self.assertLessEqual(len(self.saved_snapshots()), 5)
+        saved = self.saved_snapshots()
+        times = {it["ts"] - self.manager.APPLE_EPOCH for it in saved}
+        self.assertIn(now, times)
+        for age in (31 * 86400, 8 * 86400, 2 * 86400):
+            self.assertIn(now - age, times)
+
+    def test_bare_and_invalid_closes_preserve_fuller_and_usable_recovery(self):
+        full = snapshot("full")
+        full["panels"].append({"id": "web", "browser": {"urlString": "https://example.com"}})
+        full["layout"]["pane"]["panelIds"].append("web")
+        self.native([closed(full)])
+        self.manager.closed_history()
+        for i in range(20):
+            snap = dict(snapshot(f"bare-{i}"), customColor=f"#{i:06x}")
+            self.native([closed(snap, 800000100 + i)])
+            self.manager.closed_history()
+        self.native([closed(dict(snapshot("invalid"), layout=None), 800000200)])
+        self.manager.closed_history()
+        self.native([])
+        saved = self.saved_snapshots()
+        self.assertLessEqual(len(saved), 5)
+        self.assertTrue({"full", "bare-19", "invalid"} <= {it["id"] for it in saved})
+        selected, protected = self.manager.select_checkpoints(saved)
+        self.assertEqual({it["id"] for it in selected if self.manager.snapshot_key(it) in protected},
+                         {"full", "bare-19"})
+
+    def test_poorer_revision_of_same_native_close_does_not_erase_recovery(self):
+        original = snapshot(agent="codex")
+        self.native([closed(original)])
+        self.manager.closed_history()
+        for snap in (snapshot(), dict(snapshot(), layout=None)):
+            self.native([closed(snap)])
+            self.assertEqual(self.manager.closed_history()[0]["snapshot"], snap)
+            self.assertEqual(self.saved_snapshots()[0]["snapshot"], original)
+            item = self.manager.closed_snapshot(snap, "closed", 800000000 + self.manager.APPLE_EPOCH)
+            item["title"] = "Project"
+            self.assertEqual(self.manager.workspace_checkpoints(item)[0]["snapshot"], original)
+        self.native([])
+        self.assertEqual(self.manager.closed_history()[0]["snapshot"], original)
+
+    def test_remote_history_does_not_displace_last_locally_restorable_copy(self):
+        self.native([closed(snapshot("local", agent="codex"))])
+        self.manager.closed_history()
+        for i in range(10):
+            self.native([closed(dict(snapshot(str(i)), remote={"host": "remote-host"}), 800000100 + i)])
+            self.manager.closed_history()
+        self.native([])
+        saved = self.saved_snapshots()
+        selected, protected = self.manager.select_checkpoints(saved)
+        self.assertIn("local", {it["id"] for it in selected if self.manager.snapshot_key(it) in protected})
+
+    def test_budget_prunes_optional_copies_before_refusing_new_workspaces(self):
+        older = dict(snapshot("old"), customColor="#123456")
+        newer = dict(snapshot("new"), customColor="#234567")
+        self.native([closed(older), closed(newer, 800000100)])
+        self.manager.closed_history()
+        other = snapshot("other", cwd="/tmp/other", title="Other")
+        latest = self.manager.closed_snapshot(newer, "new", 800000100 + self.manager.APPLE_EPOCH)
+        added = self.manager.closed_snapshot(other, "other", 800000200 + self.manager.APPLE_EPOCH)
+        budget = sum(self.manager.checkpoint_info(it)[3] for it in (latest, added))
+        self.native([closed(other, 800000200)])
+        with mock.patch.object(self.manager, "ARCHIVE_LIMIT", budget):
+            self.manager.closed_history()
+        self.assertEqual({it["id"] for it in self.saved_snapshots()}, {"new", "other"})
+        self.assertEqual(Path(self.manager.SNAPSHOTS).stat().st_size, budget)
+
+    def test_full_budget_keeps_last_copies_and_allows_smaller_later_admission(self):
+        self.native([closed(snapshot("original"))])
+        self.manager.closed_history()
+        before = Path(self.manager.SNAPSHOTS).read_bytes()
+        small = snapshot("small", cwd="/tmp/small", title="Small")
+        big = dict(snapshot("big", cwd="/tmp/big", title="Big"), scrollback="x" * 5000)
+        small_item = self.manager.closed_snapshot(small, "small", 800000200 + self.manager.APPLE_EPOCH)
+        budget = len(before) + self.manager.checkpoint_info(small_item)[3]
+        self.native([closed(big, 800000100), closed(small, 800000200)])
+        notices, report = [], {}
+        with mock.patch.object(self.manager, "ARCHIVE_LIMIT", budget):
+            items = self.manager.closed_history(notices=notices, report=report)
+        self.assertEqual({it["id"] for it in items}, {"original", "big", "small"})
+        self.assertEqual({it["id"] for it in self.saved_snapshots()}, {"original", "small"})
+        self.assertLessEqual(Path(self.manager.SNAPSHOTS).stat().st_size, budget)
+        self.assertEqual(report["blocked"], 1)
+        self.assertFalse(report["complete"])
+        self.assertIn("Existing recovery copies were kept", " ".join(notices))
+        self.assertIn("80%", " ".join(notices))
+
+    def test_full_budget_cannot_replace_good_copy_with_oversized_new_version(self):
+        self.native([closed(snapshot("saved", agent="claude"))])
+        self.manager.closed_history()
+        before = Path(self.manager.SNAPSHOTS).read_bytes()
+        self.native([closed(dict(snapshot("new"), scrollback="x" * 5000), 800000100)])
+        with mock.patch.object(self.manager, "ARCHIVE_LIMIT", len(before)):
+            self.manager.closed_history()
+        self.assertEqual(Path(self.manager.SNAPSHOTS).read_bytes(), before)
+
+    def test_preexisting_overbudget_archive_preserves_protected_copies(self):
+        self.native([closed(snapshot())])
+        self.manager.closed_history()
+        before = Path(self.manager.SNAPSHOTS).read_bytes()
+        notices = []
+        with mock.patch.object(self.manager, "ARCHIVE_LIMIT", 1):
+            self.manager.closed_history(notices=notices)
+        self.assertEqual(Path(self.manager.SNAPSHOTS).read_bytes(), before)
+        self.assertIn("collection paused", " ".join(notices))
+
+    def test_future_archive_and_invalid_settings_are_preserved(self):
+        self.native([closed(snapshot())])
+        self.manager.closed_history()
+        archive = Path(self.manager.SNAPSHOTS)
+        original = archive.read_bytes()
+        settings = Path(self.manager.ARCHIVE_SETTINGS)
+        for contents in ('{', '{"version":2,"budget_mb":250}', '{"version":1,"budget_mb":true}'):
+            settings.write_text(contents)
+            notices = []
+            self.manager.closed_history(notices=notices)
+            self.assertTrue(notices)
+            self.assertEqual(archive.read_bytes(), original)
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(self.manager.set_archive_budget(500), 1)
+            self.assertEqual(settings.read_text(), contents)
+        settings.unlink()
+        archive.write_bytes(original + b'{"version":2}\n')
+        future = archive.read_bytes()
+        self.native([closed(snapshot("new", title="New"), 800000100)])
+        notices = []
+        self.assertEqual(len(self.manager.closed_history(notices=notices)), 2)
+        self.assertEqual(archive.read_bytes(), future)
+        self.assertTrue(notices)
+
+    def test_explicit_checkpoint_restore_uses_older_layout_and_default_numbering(self):
+        full = snapshot("full")
+        full["panels"].append({"id": "web", "browser": {"urlString": "https://example.com"}})
+        full["layout"]["pane"]["panelIds"].append("web")
+        self.native([closed(full), closed(snapshot("bare"), 800000100)])
+        self.manager.closed_history()
+        self.native([])
+        listing = self.run_cli("--no-interactive")
+        self.assertIn("older layout saved", listing.stdout)
+        versions = self.run_cli("archive", "versions", "1")
+        self.assertEqual(versions.returncode, 0, versions.stderr)
+        self.assertIn("1web", versions.stdout)
+        for flags, expected in (([], snapshot("bare")), (["--all", "--snapshot", "2"], full)):
+            result = self.run_cli("reopen", "1", *flags)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            cmd = [c for c in self.calls() if c[0] == "new-workspace"][-1]
+            self.assertEqual(json.loads(cmd[cmd.index("--layout") + 1]), self.manager.build_layout(expected))
+        count = len(self.calls())
+        self.assertNotEqual(self.run_cli("reopen", "1", "--snapshot", "3").returncode, 0)
+        self.assertFalse(any(c[0] == "new-workspace" for c in self.calls()[count:]))
+
+    def test_archive_commands_reject_invalid_arguments_before_history_access(self):
+        self.native([closed(snapshot())])
+        for args in (("archive",), ("archive", "budget", "0"), ("archive", "budget", "1.5"),
+                     ("archive", "versions", "0"), ("archive", "install", "extra"),
+                     ("reopen", "1", "extra"), ("--snapshot", "1"),
+                     ("reopen", "1", "--snapshot", "0"), ("reopen", "1", "--snapshot"),
+                     ("reopen", "1", "--plain", "--snapshot", "2")):
+            result = self.run_cli(*args)
+            self.assertNotEqual(result.returncode, 0, args)
+            self.assertIn("--help", result.stderr, args)
+        self.assertFalse(Path(self.manager.SNAPSHOTS).exists())
+        self.assertEqual(self.calls(), [])
+
+    def test_collector_only_reads_files_and_does_not_harvest_events(self):
+        native = self.native([closed(snapshot())])
+        events = self.events([self.close_event()])
+        before = {p: p.read_bytes() for p in (native, events)}
+        result = self.run_cli("archive", "collect")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(Path(self.manager.HISTORY).exists())
+        self.assertEqual({p: p.read_bytes() for p in before}, before)
+        status = json.loads(Path(self.manager.ARCHIVE_STATUS).read_text())
+        self.assertTrue(status["complete"])
+        self.assertEqual(status["budget_bytes"], 250_000_000)
+        self.assertEqual(status["snapshots"], 1)
+
+    def test_notifications_are_fixed_and_deduplicated_across_collectors(self):
+        self.native([closed(snapshot())])
+        with mock.patch.object(self.manager, "ARCHIVE_LIMIT", 1), \
+                mock.patch.object(self.manager.sys, "platform", "darwin"), \
+                mock.patch.object(self.manager.subprocess, "run") as run, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            for _ in range(3):
+                self.assertEqual(self.manager.collect_archive(), 1)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.kwargs["timeout"], 5)
+            self.assertNotIn("Project", str(run.call_args))
+            self.assertIn("archive status", str(run.call_args))
+            self.native([])
+            self.assertEqual(self.manager.collect_archive(), 0)
+            self.native([closed(snapshot())])
+            self.assertEqual(self.manager.collect_archive(), 1)
+            self.assertEqual(run.call_count, 2)
+
+    def test_stale_status_cannot_overwrite_newer_collection(self):
+        self.native([closed(snapshot())])
+        self.manager.closed_history()
+        path = Path(self.manager.ARCHIVE_STATUS)
+        before = path.read_bytes()
+        self.manager.save_archive_status({"collected_at": 1, "complete": False, "notices": []}, True)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_invalid_native_history_reports_incomplete_collection(self):
+        path = self.native([closed(snapshot())])
+        self.manager.closed_history()
+        original = Path(self.manager.SNAPSHOTS).read_bytes()
+        path.write_text("{")
+        report = {}
+        self.manager.closed_history(report=report)
+        self.assertFalse(report["complete"])
+        self.assertEqual(Path(self.manager.SNAPSHOTS).read_bytes(), original)
+
+    def test_valid_native_copy_repairs_malformed_archived_copy_of_same_close(self):
+        self.native([closed(snapshot())])
+        self.manager.closed_history()
+        path = Path(self.manager.SNAPSHOTS)
+        record = json.loads(path.read_text())
+        record["snapshot"]["malformed"] = float("nan")
+        path.write_text(json.dumps(record) + "\n")
+        report = {}
+        self.manager.closed_history(report=report)
+        self.assertTrue(report["complete"])
+        self.assertEqual(self.saved_snapshots()[0]["snapshot"], snapshot())
+
+    def test_collector_install_uninstall_and_launchd_definition(self):
+        with mock.patch.object(self.manager.sys, "platform", "darwin"), \
+                mock.patch.object(self.manager, "launchctl", side_effect=[False, True, True, True]) as ctl, \
+                mock.patch.object(self.manager, "collect_archive", return_value=0), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.manager.configure_collector(True), 0)
+            path = Path(self.manager.COLLECTOR_PLIST)
+            data = plistlib.loads(path.read_bytes())
+            self.assertEqual(data["ProgramArguments"], ["/usr/bin/python3", self.manager.COLLECTOR_SCRIPT,
+                                                        "archive", "collect"])
+            script = Path(self.manager.COLLECTOR_SCRIPT)
+            self.assertEqual(script.read_bytes(), CLI.read_bytes())
+            self.assertEqual(script.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(data["StartInterval"], 60)
+            self.assertEqual(data["WatchPaths"], [self.manager.NATIVE])
+            self.assertTrue(data["RunAtLoad"])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.manager.configure_collector(False), 0)
+            self.assertFalse(path.exists())
+            self.assertFalse(script.exists())
+            self.assertEqual([c.args[0][0] for c in ctl.call_args_list], ["print", "bootstrap", "print", "bootout"])
+
+    def test_collector_failed_install_restores_previous_plist_and_service(self):
+        path = Path(self.manager.COLLECTOR_PLIST)
+        path.parent.mkdir(parents=True)
+        previous = plistlib.dumps({"Label": self.manager.COLLECTOR_LABEL, "StartInterval": 90})
+        path.write_bytes(previous)
+        script = Path(self.manager.COLLECTOR_SCRIPT)
+        script.parent.mkdir(parents=True)
+        script.write_bytes(b"previous collector")
+        with mock.patch.object(self.manager.sys, "platform", "darwin"), \
+                mock.patch.object(self.manager, "launchctl", side_effect=[True, True, False, True]) as ctl, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.manager.configure_collector(True), 1)
+        self.assertEqual(path.read_bytes(), previous)
+        self.assertEqual(script.read_bytes(), b"previous collector")
+        self.assertEqual([c.args[0][0] for c in ctl.call_args_list],
+                         ["print", "bootout", "bootstrap", "bootstrap"])
+
+    def test_archive_budget_changes_cannot_evict_last_copies(self):
+        self.native([closed(dict(snapshot(), scrollback="x" * 1_000_000))])
+        self.manager.closed_history()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.manager.set_archive_budget(1), 1)
+            self.assertFalse(Path(self.manager.ARCHIVE_SETTINGS).exists())
+            self.assertEqual(self.manager.set_archive_budget(2), 0)
+        self.assertEqual(self.manager.archive_budget(), 2_000_000)
+        self.assertEqual(len(self.saved_snapshots()), 1)
+
+    def test_archive_status_detects_background_startup_failure_without_writes(self):
+        self.native([closed(snapshot())])
+        self.manager.closed_history()
+        output = io.StringIO()
+        before = Path(self.manager.ARCHIVE_STATUS).read_bytes()
+        result = subprocess.CompletedProcess([], 0, "state = not running\nlast exit code = 2\n", "")
+        with mock.patch.object(self.manager.subprocess, "run", return_value=result) as run, \
+                mock.patch.object(self.manager.sys, "platform", "darwin"), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(self.manager.archive_status(), 1)
+        self.assertIn("Last background exit code: 2", output.getvalue())
+        self.assertEqual(Path(self.manager.ARCHIVE_STATUS).read_bytes(), before)
+        self.assertEqual(run.call_args.kwargs["timeout"], 10)
+        self.assertEqual(run.call_args.args[0][:2], ["launchctl", "print"])
+
+    def test_background_group_save_preserves_newer_aliases_and_names(self):
+        self.manager.save_group_catalog({"version": 1, "groups": {GROUP_A: {"name": "Old", "ts": 1}},
+                                         "aliases": {GROUP_A: GROUP_B}})
+        stale = self.manager.load_group_catalog()
+        current = self.manager.load_group_catalog()
+        current["aliases"][GROUP_A] = GROUP_C
+        current["groups"][GROUP_A] = {"name": "New", "ts": 2}
+        self.manager.save_group_catalog(current)
+        self.manager.save_group_catalog(stale, save_aliases=False)
+        saved = self.manager.load_group_catalog()
+        self.assertEqual(saved["aliases"][GROUP_A], GROUP_C)
+        self.assertEqual(saved["groups"][GROUP_A]["name"], "New")
+
+    def test_older_archived_snapshot_does_not_hide_close_after_native_restore(self):
+        self.native([closed(snapshot())])
+        self.manager.entries()
+        self.native([])
+        created = dict(self.close_event(at=800000100), name="workspace.created", id="created")
+        self.events([self.close_event(), created, self.close_event(at=800000200)])
+        item, = self.manager.entries()
+        self.assertNotIn("snapshot", item)
+        self.assertEqual(item["ts"], 800000200 + self.manager.APPLE_EPOCH)
+
+    def test_archived_close_does_not_mask_later_event_when_create_was_missed(self):
+        self.native([closed(snapshot())])
+        event = self.close_event()
+        event["occurred_at"] = event["occurred_at"].replace("Z", ".025Z")
+        self.events([event])
+        self.assertIn("snapshot", self.manager.entries()[0])
+        self.native([])
+        self.assertIn("snapshot", self.manager.entries()[0])
+        self.events([self.close_event(at=800000200)])
+        item, = self.manager.entries()
+        self.assertNotIn("snapshot", item)
+        self.assertEqual(item["ts"], 800000200 + self.manager.APPLE_EPOCH)
+        self.assertEqual(len(self.manager.entries(True)), 2)
+
+    def test_deleting_archived_closes_keeps_them_hidden_and_prevents_grafting(self):
+        self.native([closed(snapshot("older", agent="claude")),
+                     closed(snapshot("newer"), 800000100)])
+        self.manager.entries()
+        self.native([])
+        item, = self.manager.entries()
+        self.assertTrue(item["grafted"])
+        self.assertIsNone(self.manager.delete_entry(item))
+        self.assertEqual(self.manager.entries(True), [])
+        self.native([closed(snapshot("later"), 800000200)])
+        item, = self.manager.entries()
+        self.assertEqual(item["id"], "later")
+        self.assertNotIn("grafted", item)
+
+    def test_list_and_picker_expose_missing_or_unusable_snapshot(self):
+        self.native([closed(dict(snapshot("bad"), layout=None)),
+                     closed(snapshot("good", title="Good"), 800000100)])
+        self.events([self.close_event("missing", title="Missing", cwd="/tmp/missing")])
+        items = self.manager.entries()
+        for item in items:
+            self.assertEqual("no snapshot" in self.manager.badges(item), item["id"] != "good")
+        result = self.run_cli("--no-interactive")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("(no usable snapshot)"), 2)
 
     def test_legacy_array_and_closed_window_workspaces(self):
         snaps = [snapshot("first"), snapshot("second", "/tmp/second")]

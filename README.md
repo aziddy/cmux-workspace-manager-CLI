@@ -25,6 +25,10 @@ Arrow to a workspace, press enter, and it comes back. Each entry's second line
 shows the saved group, git branch, and what a reopen would restore: terminals
 (`T`), resumable AI sessions (`AI`), and browser tabs (`web`). Entries cmux has no
 snapshot for say `no snapshot` — those can only be reopened empty.
+Malformed layouts also say `no snapshot`. The plain listing marks both cases
+with `(no usable snapshot)`.
+`older layout saved` means a fuller or usable earlier checkpoint is available;
+use `archive versions <n>` to inspect it and `reopen <n> --snapshot <k>` to restore it.
 `group unknown` means cmux saved a group ID but its name is no longer available.
 
 `AI*` means the session was carried over from an earlier close of the same
@@ -75,6 +79,9 @@ line, and `NO_COLOR` is honored in the picker.
 The command-line option `reopen <n> --plain` opens an empty workspace at the
 saved directory and title, without restoring the layout or sessions.
 It also skips restoring the saved workspace color and group membership.
+`reopen <n> --snapshot <k>` selects an older checkpoint listed by
+`archive versions <n>`. It cannot be combined with `--plain`. Both commands use
+the default workspace numbering, even when `reopen` also receives `--all`.
 
 Run `cmux-ws-manager --help` for the full option list. An unrecognized option
 is a usage error, not a silent no-op.
@@ -107,10 +114,11 @@ removes all existing closes of the selected workspace.
 
 Removals are remembered in `~/.cmuxterm/workspace-deletions.json`, which stores
 workspace identities, IDs, and close-time cutoffs, without snapshots or session
-payloads. cmux's native History and the source logs are preserved; this removes
-entries only from this tool. A later close of the same workspace can appear
-again, without inheriting AI sessions from its deleted snapshots. If saving a
-removal fails, an error is shown and the selected entry remains available.
+payloads. cmux's native History and source logs are preserved. Matching copies
+in the manager's snapshot archive are reclaimed during the next collection.
+A later close of the same workspace can appear again, without inheriting AI sessions from its deleted
+snapshots. If saving a removal fails, an error is shown and the selected entry
+remains available.
 
 ## Settings differences
 
@@ -283,9 +291,34 @@ Two sources, merged and deduplicated:
    git branch, layout snapshot, the workspace's custom title, color, and group ID,
    and — for a pane cmux has bound to an agent — a `resumeBinding` with the checkpoint id that
    `cmux restore` takes after a matching surface binding is installed. Primary
-   source; nothing needs to run in the background. Retention is bounded by the
-   app: cmux 0.64.24 defaults to 500 total records and at most 100 workspace
-   records, rather than a fixed number of days.
+   source. Retention is bounded by the app: cmux 0.64.24 defaults to 500 total
+   records and at most 100 workspace
+   records, rather than a fixed number of days. Closed panels count toward
+   the same total, so heavy panel activity can evict workspace snapshots quickly.
+
+   Each history listing or reopen copies observed workspace snapshots, including
+   workspaces inside closed-window records, into
+   `~/.cmuxterm/workspace-snapshots.jsonl`. This archive retains **up to five
+   meaningful checkpoints per workspace within a 250 MB budget**. The optional
+   background collector saves snapshots even when the manager is not open.
+   Snapshots are saved before open-workspace filtering. Confirmed deletions are
+   excluded and reclaimed during the next collection. Native records take
+   precedence while still available, but a poorer revision of the same close
+   cannot erase an archived usable recovery copy. Existing filtering and `--all`
+   behavior apply to archived snapshots. A later event-only close keeps its own
+   missing-snapshot warning even when an older close has been archived.
+
+   The archive preserves layouts, directories, browser URLs, agent bindings,
+   colors, and saved group metadata. Its file is created with owner-only access
+   and concurrent runs coordinate atomic replacements. Unreadable or unwritable
+   archives produce a notice while remaining history stays usable. `--help` and
+   `settings diff` do not read or create the archive.
+
+   **Preservation starts when a snapshot is observed and successfully saved.**
+   Enable background collection to reduce gaps between runs. It cannot recover
+   layouts already evicted or capture closes that appear and disappear between
+   collections. Events alone contain no terminal or browser layout; those
+   entries reopen empty.
 2. **The cmux event log** (`~/.cmuxterm/events.jsonl`) — cmux appends every
    event here, but rotates it at 16 MiB with a single archive, so busy
    sessions age events out within a day. Each run of `cmux-ws-manager` harvests
@@ -310,6 +343,70 @@ anything is displayed or printed.
 Malformed records are skipped, and unavailable history files do not prevent
 listing the remaining sources. Both the current native history envelope and
 legacy arrays of records are accepted.
+
+## Snapshot retention and background collection
+
+```sh
+cmux-ws-manager archive install       # enable the per-user launchd collector
+cmux-ws-manager archive status        # usage, budget, collector and last result
+cmux-ws-manager archive collect       # collect immediately
+cmux-ws-manager archive versions 2    # checkpoints for workspace 2
+cmux-ws-manager reopen 2 --snapshot 2  # restore its second checkpoint
+cmux-ws-manager archive budget 500    # optional: change the budget in decimal MB
+cmux-ws-manager archive uninstall     # disable collector; keep snapshots
+```
+
+The default is **five checkpoints per workspace and 250 MB total**, with a warning
+at **80% capacity**. Workspace identity follows the listing: normalized directory
+and custom title, or directory alone without a custom title. Renames can create
+separate identities.
+
+- Equivalent restorable layouts are deduplicated, including freshly generated
+  workspace and panel IDs. Changed directories, URLs, supported agent sessions,
+  pane names, colors and saved groups count as changes.
+- The newest usable checkpoint is protected. If it is a bare shell, the most
+  recent fuller layout (multiple terminals, browsers or agent sessions) is also
+  protected. Repeated empty reopens cannot push that fuller layout out. Malformed
+  layouts cannot replace the last usable copy.
+- Remaining slots favor checkpoints about a day, a week and a month behind the
+  newest one, when available, then spread across the remaining history. Five is
+  a maximum, not a guarantee of five daily backups; only observed distinct
+  snapshots can be kept. Older protected copies have no age expiry.
+- At capacity, optional older versions are removed first. If protected recovery
+  copies would exceed the budget, new snapshots are refused with a warning;
+  existing recovery copies remain. A full archive therefore needs attention:
+  increase its budget or delete selected saved workspaces. Reducing the budget
+  below what protected copies need is refused. A preexisting archive already
+  above such a limit is preserved and collection pauses until space is available.
+
+`archive install` creates a LaunchAgent for the current user. While logged in,
+it runs at load, on native history-file changes, and every 60 seconds (with a
+10-second throttle). It reads history and saved group metadata directly; it
+does not open/focus workspaces, run agent sessions, query the cmux CLI, or harvest
+events. Sleep, logout, write failures, and native eviction between checks can
+still leave gaps. The job uses `/usr/bin/python3` and a private runtime copy in
+`~/Library/Application Support/cmux-ws-manager/collector.py`, so a checkout under
+Documents does not block launchd access. **Rerun `archive install` after upgrading
+the CLI** to refresh that copy. A normal listing or reopen also
+collects snapshots, even without the job installed.
+
+Collection warnings appear in CLI output and the picker. Background collection
+also requests a macOS notification when entering the capacity-warning or
+failed-collection state; notification delivery depends on macOS settings.
+`archive status` retains the last result and reports the last background exit
+code. A loaded collector alone does not prove successful collection: check
+those results and the collection timestamp.
+
+The budget covers `workspace-snapshots.jsonl`, including its JSONL metadata.
+Atomic replacement can temporarily require space for both the old and new files.
+The separate event history, group catalog and deletion metadata are outside this
+budget. The existing `workspace-history.jsonl` event history still does not
+rotate; this policy bounds snapshot storage. Archive settings and bounded status
+live in `~/.cmuxterm/workspace-archive-{settings,status}.json`; the LaunchAgent is
+`~/Library/LaunchAgents/com.aziddy.cmux-ws-manager.collector.plist`.
+
+This improves preservation of future closes; it cannot reconstruct a previously
+lost layout.
 
 ## Compatibility and checks
 

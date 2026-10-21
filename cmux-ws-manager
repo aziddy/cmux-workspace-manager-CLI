@@ -20,6 +20,8 @@ Primary source: cmux's own closed-item history
 (~/Library/Application Support/cmux/closed-item-history-*.json), which the
 app maintains for every closed workspace and panel. It stores cwd, layout,
 git branch, the workspace's custom title, and group ID; its retention is bounded.
+Each run archives observed workspace snapshots in
+~/.cmuxterm/workspace-snapshots.jsonl before cmux can age them out.
 
 Supplement: workspace-category events harvested from the rotating
 ~/.cmuxterm/events.jsonl logs into ~/.cmuxterm/workspace-history.jsonl on
@@ -34,7 +36,7 @@ With no command this runs an interactive curses browser; it falls back to
 the plain listing whenever a terminal is not available or --no-interactive
 is given, so scripts and agents always get parseable text.
 """
-import fcntl, json, locale, math, os, plistlib, re, shlex, shutil, subprocess, sys, tempfile, unicodedata
+import fcntl, hashlib, json, locale, math, os, plistlib, re, shlex, shutil, subprocess, sys, tempfile, unicodedata
 from datetime import datetime
 from xml.parsers.expat import ExpatError
 try:
@@ -45,6 +47,14 @@ except ImportError:  # until initscr, so --help stays unaffected
 LOG_DIR = os.path.expanduser("~/.cmuxterm")
 ROTATING = [os.path.join(LOG_DIR, "events.jsonl.1"), os.path.join(LOG_DIR, "events.jsonl")]
 HISTORY = os.path.join(LOG_DIR, "workspace-history.jsonl")
+SNAPSHOTS = os.path.join(LOG_DIR, "workspace-snapshots.jsonl")
+ARCHIVE_SETTINGS = os.path.join(LOG_DIR, "workspace-archive-settings.json")
+ARCHIVE_STATUS = os.path.join(LOG_DIR, "workspace-archive-status.json")
+ARCHIVE_LIMIT = 250_000_000  # decimal MB, including the JSONL envelope
+ARCHIVE_VERSIONS = 5
+COLLECTOR_LABEL = "com.aziddy.cmux-ws-manager.collector"
+COLLECTOR_PLIST = os.path.expanduser("~/Library/LaunchAgents/" + COLLECTOR_LABEL + ".plist")
+COLLECTOR_SCRIPT = os.path.expanduser("~/Library/Application Support/cmux-ws-manager/collector.py")
 NATIVE = os.path.expanduser(
     "~/Library/Application Support/cmux/closed-item-history-com.cmuxterm.app.json")
 SESSIONS = [os.path.join(os.path.dirname(NATIVE), name) for name in
@@ -56,6 +66,7 @@ APPLE_EPOCH = 978307200  # 2001-01-01 UTC, the reference for closedAt
 AGENT_RESUME = {"claude": ["claude", "--resume"], "codex": ["codex", "resume"],
                 "opencode": ["opencode", "--session"]}
 GRAFT_WINDOW = 7 * 86400  # maximum age of a carried-over session
+CLOSE_EVENT_SLOP = 2  # native snapshots and their close events have slightly different timestamps
 
 # Factory values and preference mappings verified against cmux 0.64.25,
 # commit b685a275c (CmuxSettings catalog, settings parsers, shortcut actions).
@@ -450,9 +461,11 @@ SHORTCUT_DEFAULTS = {
 SHORTCUT_DYNAMIC = frozenset(('switchRightSidebarToFiles', 'switchRightSidebarToFind', 'switchRightSidebarToSessions', 'switchRightSidebarToFeed', 'switchRightSidebarToDock', 'switchRightSidebarToMachines'))
 
 HELP = """usage: {prog} [--all] [--no-interactive]
-       {prog} reopen <n> [--plain]
+       {prog} reopen <n> [--plain | --snapshot <k>]
        {prog} delete <n>
        {prog} settings diff
+       {prog} archive status|collect|install|uninstall
+       {prog} archive budget <MB> | archive versions <n>
 
 List cmux workspaces you've closed, and reopen them.
 
@@ -470,6 +483,12 @@ Commands:
                     cmux's native History is preserved; future closes can appear.
   settings diff     Compare local cmux settings with verified factory defaults.
                     Read-only; does not load or harvest workspace history.
+  archive status    Show snapshot storage, capacity and collection status.
+  archive collect   Save available snapshots now without querying cmux.
+  archive install   Enable collection at login, on history changes and every 60s.
+  archive uninstall Disable background collection; keep saved snapshots.
+  archive budget    Set the snapshot budget in decimal MB (default: 250).
+  archive versions  List recovery checkpoints for workspace <n>.
 
 Options:
   --all             Show the raw close history instead of the default
@@ -477,12 +496,15 @@ Options:
   --no-interactive  Skip the browser and print the plain listing.
   --plain           With reopen: skip layout, color, and group restore; open an
                     empty workspace at the original directory.
+  --snapshot <k>    With reopen: choose checkpoint <k> from archive versions <n>.
   -h, --help        Show this message and exit.
 
 reopen <n> and delete <n> numbering always follows the default view,
 including when --all is supplied. Deleted entries stay hidden under --all.
 Search matches title, path, or saved group name. Reopening follows an existing
 group into its window, or recreates a missing named group in the caller's window.
+Snapshots retain up to 5 distinct checkpoints per workspace, protecting usable
+recovery copies. At capacity, new saves are refused with a warning.
 """
 
 def as_dict(value):
@@ -953,33 +975,28 @@ def load_group_catalog():
             catalog["aliases"][source] = target
     return catalog
 
-def save_group_catalog(catalog):
+def save_group_catalog(catalog, save_aliases=True):
     """Atomically store names and recreated identities, never session payloads."""
     if not catalog["groups"] and not catalog["aliases"]:
         return True
-    old = read_json(GROUPS)
-    if old == catalog:
-        return True
-    if isinstance(old, dict) and old.get("version") not in (None, 1):
-        return False  # do not overwrite a newer catalog format
-    temporary = None
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
-        with tempfile.NamedTemporaryFile(mode="w", dir=LOG_DIR,
-                                         prefix=".workspace-groups-", delete=False) as f:
-            temporary = f.name
-            json.dump(catalog, f, allow_nan=False)
-            f.write("\n")
-        os.replace(temporary, GROUPS)
+        fd = os.open(GROUPS + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            old = read_json(GROUPS)
+            if isinstance(old, dict) and old.get("version") not in (None, 1):
+                return False  # do not overwrite a newer catalog format
+            merged = load_group_catalog()
+            for group_id, info in catalog["groups"].items():
+                remember_group(merged, group_id, info["name"], info["ts"])
+            if save_aliases:
+                merged["aliases"].update(catalog["aliases"])
+            if old != merged:
+                atomic_write(GROUPS, (json.dumps(merged, allow_nan=False) + "\n").encode())
         return True
     except (OSError, ValueError):
         return False
-    finally:
-        if temporary:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
 
 def session_groups(catalog):
     for path in SESSIONS:
@@ -1045,10 +1062,22 @@ def iso_to_unix(ts):
     except (ValueError, AttributeError, OverflowError, OSError):
         return 0
 
-def native_closed(catalog=None):
+def closed_snapshot(snap, wsid, ts, group_name=""):
+    if not isinstance(snap, dict) or not finite_number(ts):
+        return None
+    return {"ts": ts, "id": as_text(wsid) or as_text(snap.get("workspaceId")),
+            "cwd": as_text(snap.get("currentDirectory")),
+            "branch": as_text(as_dict(snap.get("gitBranch")).get("branch")),
+            "title": "", "custom": as_text(snap.get("customTitle")),
+            "snapshot": snap, "group_id": as_uuid(snap.get("groupId")),
+            "group_name": as_text(group_name)}
+
+def native_closed(catalog=None, notices=None):
     d = read_json(NATIVE)
     out = []
     records = d if isinstance(d, list) else as_dict(d).get("records")
+    if not isinstance(records, list) and os.path.exists(NATIVE) and notices is not None:
+        notices.append("Could not read native closed-item history; collection is incomplete.")
     for r in as_list(records):
         r = as_dict(r)
         closed_at = r.get("closedAt", 0)
@@ -1074,17 +1103,542 @@ def native_closed(catalog=None):
             wsid = as_text(as_dict(snap).get("workspaceId"))
             snapshots.append((snap, wsid or (window_ids[i] if i < len(window_ids) else ""), names))
         for snap, wsid, names in snapshots:
-            if not isinstance(snap, dict):
-                continue
-            group_id = as_uuid(snap.get("groupId"))
-            out.append({"ts": closed_at + APPLE_EPOCH,
-                        "id": as_text(wsid) or as_text(snap.get("workspaceId")),
-                        "cwd": as_text(snap.get("currentDirectory")),
-                        "branch": as_text(as_dict(snap.get("gitBranch")).get("branch")),
-                        "title": "", "custom": as_text(snap.get("customTitle")),
-                        "snapshot": snap, "group_id": group_id,
-                        "group_name": names.get(group_id, "")})
+            group_id = as_uuid(as_dict(snap).get("groupId"))
+            item = closed_snapshot(snap, wsid, closed_at + APPLE_EPOCH, names.get(group_id, ""))
+            if item is not None:
+                out.append(item)
     return out
+
+def snapshot_key(item):
+    return item["id"] or identity(item), item["ts"]
+
+def read_snapshot_archive(f):
+    items, digest = {}, hashlib.sha256()
+    meta = {"invalid": False, "future": False}
+    for line in f:
+        digest.update(line.encode("utf-8"))
+        try:
+            data = as_dict(json.loads(line))
+        except (ValueError, RecursionError):
+            meta["invalid"] = True
+            continue
+        if type(data.get("version")) is not int or data["version"] != 1:
+            meta["future"] |= type(data.get("version")) is int and data["version"] > 1
+            meta["invalid"] = True
+            continue
+        item = closed_snapshot(data.get("snapshot"), data.get("id"), data.get("ts"),
+                               data.get("group_name"))
+        if item is not None:
+            items[snapshot_key(item)] = item
+        else:
+            meta["invalid"] = True
+    meta["hash"] = digest.hexdigest()
+    return items, meta
+
+def atomic_write(path, data):
+    """Replace a private file only after its complete contents reach disk."""
+    temporary = None
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=os.path.dirname(path), prefix=".workspace-",
+                                         delete=False) as f:
+            temporary = f.name  # NamedTemporaryFile creates owner-only files
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+def archive_budget():
+    try:
+        with open(ARCHIVE_SETTINGS) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return ARCHIVE_LIMIT
+    if (not isinstance(data, dict) or type(data.get("version")) is not int
+            or data["version"] != 1 or type(data.get("budget_mb")) is not int
+            or not 1 <= data["budget_mb"] <= 100_000):
+        raise ValueError("Invalid archive budget settings")
+    return data["budget_mb"] * 1_000_000
+
+def archive_line(item):
+    return json.dumps({"version": 1, "id": item["id"], "ts": item["ts"],
+                       "snapshot": item["snapshot"], "group_name": item["group_name"]},
+                      allow_nan=False, separators=(",", ":")) + "\n"
+
+def checkpoint_info(item):
+    """Compare restorable content, ignoring regenerated workspace/panel IDs."""
+    if "_checkpoint" in item:
+        return item["_checkpoint"]
+    snap = item["snapshot"]
+    layout = build_layout(snap, bind_sessions=False)
+    panels = {as_text(p.get("id")) for p in as_list(snap.get("panels"))
+              if isinstance(p, dict) and as_text(p.get("id"))}
+
+    def references(node):
+        node = as_dict(node)
+        if node.get("type") == "split":
+            split = as_dict(node.get("split"))
+            return references(split.get("first")) and references(split.get("second"))
+        ids = as_list(as_dict(node.get("pane")).get("panelIds"))
+        return bool(ids) and all(as_text(pid) in panels for pid in ids)
+
+    try:
+        usable = layout is not None and references(snap.get("layout")) and not remote_snapshot(snap)
+    except RecursionError:
+        usable = False
+    t, a, b = restore_counts(snap)
+    full = usable and (a > 0 or b > 0 or t > 1)
+    # Keep unsupported or remote content distinct; local equivalence describes
+    # precisely the layout, sessions, color and group this CLI can restore.
+    content = {"layout": layout, "color": snap.get("customColor"),
+               "group": item["group_id"], "group_name": item["group_name"]}
+    unsupported = any(not isinstance(p, dict) or not any(
+        isinstance(p.get(kind), dict) for kind in ("terminal", "browser"))
+        for p in as_list(snap.get("panels")))
+    if not usable or remote_snapshot(snap) or unsupported:
+        content = snap
+    encoded = json.dumps(content, sort_keys=True, allow_nan=False).encode("utf-8")
+    info = (hashlib.sha256(encoded).hexdigest(), usable, full,
+            len(archive_line(item).encode("utf-8")))
+    item["_checkpoint"] = info
+    return info
+
+def select_checkpoints(items):
+    """Latest, usable recovery, and checkpoints spread across days/weeks."""
+    unique = {}
+    for item in sorted(items, key=lambda it: (it["ts"], it["id"]), reverse=True):
+        unique.setdefault(checkpoint_info(item)[0], item)
+    ordered = list(unique.values())
+    if not ordered:
+        return [], set()
+    selected, protected = [], set()
+
+    def add(item, protect=False):
+        if item is not None:
+            key = snapshot_key(item)
+            if all(snapshot_key(it) != key for it in selected):
+                selected.append(item)
+            if protect:
+                protected.add(key)
+
+    latest = ordered[0]
+    add(latest)
+    usable = next((it for it in ordered if checkpoint_info(it)[1]), None)
+    add(usable or latest, True)
+    # A plain/fallback reopen is indistinguishable from an intentionally bare
+    # shell. Conservatively retain the most recent fuller layout in either case.
+    if usable is not None and not checkpoint_info(usable)[2]:
+        add(next((it for it in ordered if checkpoint_info(it)[2]), None), True)
+    for days in (30, 7, 1):
+        if len(selected) < ARCHIVE_VERSIONS:
+            add(next((it for it in ordered if it["ts"] <= latest["ts"] - days * 86400
+                      and it not in selected), None))
+    while len(selected) < min(ARCHIVE_VERSIONS, len(ordered)):
+        add(max((it for it in ordered if it not in selected),
+                key=lambda it: (min(abs(it["ts"] - s["ts"]) for s in selected), it["ts"])))
+    return selected, protected
+
+def fit_archive(groups, budget):
+    """Drop optional versions first; never evict a protected recovery copy."""
+    items, protected = [], set()
+    for group in groups.values():
+        selected, required = select_checkpoints(group)
+        items.extend(selected)
+        protected.update(required)
+    total = sum(checkpoint_info(it)[3] for it in items)
+    optional = sorted((it for it in items if snapshot_key(it) not in protected),
+                      key=lambda it: (it["ts"], it["id"]))
+    dropped = set()
+    for item in optional:
+        if total <= budget:
+            break
+        dropped.add(snapshot_key(item))
+        total -= checkpoint_info(item)[3]
+    if total > budget:
+        return None
+    result = {}
+    for item in items:
+        if snapshot_key(item) not in dropped:
+            result.setdefault(identity(item), []).append(item)
+    return result
+
+def archive_inventory():
+    try:
+        with open(SNAPSHOTS, encoding="utf-8", errors="replace") as f:
+            return read_snapshot_archive(f)
+    except FileNotFoundError:
+        return {}, {"hash": hashlib.sha256(b"").hexdigest(), "invalid": False, "future": False}
+
+def closed_history(catalog=None, notices=None, report=None, notify=False):
+    """Collect without querying cmux; atomically compact under a stable lock."""
+    notices = notices if notices is not None else []
+    report = report if report is not None else {}
+    report.update(complete=True, blocked=0)
+    native, saved = [], {}
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        fd = os.open(SNAPSHOTS + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            report["collected_at"] = datetime.now().timestamp()
+            native_notices = []
+            native = native_closed(catalog, native_notices)
+            if native_notices:
+                notices.extend(native_notices)
+                report["complete"] = False
+            saved, meta = archive_inventory()
+            if meta["future"]:
+                raise ValueError("Newer archive format")
+            budget, groups, valid_saved = archive_budget(), {}, {}
+            cutoffs = deletion_cutoffs()
+            for item in saved.values():
+                if not was_deleted(item, cutoffs):
+                    try:
+                        checkpoint_info(item)
+                    except (ValueError, RecursionError):
+                        meta["invalid"] = True
+                        continue
+                    groups.setdefault(identity(item), []).append(item)
+                    valid_saved[snapshot_key(item)] = item
+            kept = fit_archive(groups, budget)
+            if kept is None:
+                report.update(complete=False, blocked=len(native))
+                notices.append("Snapshot archive exceeds its budget with protected copies alone; "
+                               "collection paused. Increase the archive budget or delete saved workspaces.")
+            else:
+                for item in sorted(native, key=lambda it: (it["ts"], it["id"])):
+                    if was_deleted(item, cutoffs):
+                        continue
+                    try:
+                        checkpoint_info(item)
+                    except (ValueError, RecursionError):
+                        notices.append("A malformed workspace snapshot could not be archived.")
+                        report["complete"] = False
+                        continue
+                    key = identity(item)
+                    prior = valid_saved.get(snapshot_key(item))
+                    if (prior is not None and prior["snapshot"] == item["snapshot"]
+                            and prior["group_name"] == item["group_name"]
+                            and any(snapshot_key(it) == snapshot_key(item) for it in kept.get(key, []))):
+                        continue
+                    # A revised native record must not erase a usable/full
+                    # recovery copy of that very same close.
+                    if prior is not None and checkpoint_info(prior)[1:3] > checkpoint_info(item)[1:3]:
+                        continue
+                    group = [it for it in kept.get(key, []) if snapshot_key(it) != snapshot_key(item)]
+                    proposal = dict(kept)
+                    if prior is not None and identity(prior) != key:
+                        old_key = identity(prior)
+                        proposal[old_key] = [it for it in kept.get(old_key, [])
+                                             if snapshot_key(it) != snapshot_key(item)]
+                    proposal[key] = group + [item]
+                    fitted = fit_archive(proposal, budget)
+                    if fitted is None:
+                        report["blocked"] += 1
+                        report["complete"] = False
+                    else:
+                        kept = fitted
+                selected = [it for group in kept.values() for it in group]
+                data = "".join(archive_line(it) for it in sorted(
+                    selected, key=lambda it: (it["ts"], it["id"]))).encode("utf-8")
+                if hashlib.sha256(data).hexdigest() != meta["hash"]:
+                    atomic_write(SNAPSHOTS, data)
+                saved = {snapshot_key(it): it for it in selected}
+                if meta["invalid"]:
+                    notices.append("Skipped malformed archive records while compacting readable snapshots.")
+                if report["blocked"]:
+                    notices.append(f"Snapshot archive is full: {report['blocked']} snapshot(s) could not "
+                                   "be saved. Existing recovery copies were kept. Use 'archive budget' "
+                                   "or delete saved workspaces to make room.")
+                if len(data) >= budget * 0.8:
+                    notices.append(f"Snapshot archive is at {len(data) / 1_000_000:.1f} / "
+                                   f"{budget / 1_000_000:g} MB (80% capacity warning).")
+            report.update(budget_bytes=budget, bytes=os.path.getsize(SNAPSHOTS) if os.path.exists(SNAPSHOTS) else 0,
+                          snapshots=len(saved), workspaces=len({identity(it) for it in saved.values()}))
+    except (OSError, ValueError, RecursionError):
+        report["complete"] = False
+        if "collected_at" not in report:
+            report["collected_at"] = datetime.now().timestamp()
+            native = native_closed(catalog)
+        try:
+            saved, _ = archive_inventory()
+        except OSError:
+            pass
+        notices.append("Could not save workspace snapshots; existing archive preserved. "
+                       "Check archive permissions, format and budget settings.")
+    report["notices"] = notices[:10]
+    save_archive_status(report, notify)
+    notices.extend(note for note in report["notices"] if note not in notices)
+    saved.update((snapshot_key(item), item) for item in native)
+    if catalog is not None:
+        for item in saved.values():
+            remember_group(catalog, item["group_id"], item["group_name"], item["ts"])
+    return [closed_snapshot(it["snapshot"], it["id"], it["ts"], it["group_name"])
+            for it in saved.values()]
+
+def save_archive_status(report, notify=False):
+    """Serialize status/notification transitions even when collections overlap."""
+    try:
+        fd = os.open(ARCHIVE_STATUS + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            previous = as_dict(read_json(ARCHIVE_STATUS))
+            if (finite_number(previous.get("collected_at")) and
+                    previous["collected_at"] > report["collected_at"]):
+                return
+            for field in ("notification_level", "notification_at"):
+                if field in previous:
+                    report[field] = previous[field]
+            if notify:
+                archive_notification(report, previous)
+            atomic_write(ARCHIVE_STATUS, (json.dumps(report, allow_nan=False) + "\n").encode())
+    except OSError:
+        report["complete"] = False
+        report["notices"].append("Could not save archive collection status.")
+
+def archive_notification(report, previous):
+    """Alert once per capacity/error transition, using fixed, non-private text."""
+    level = ("blocked" if not report.get("complete") else
+             "warning" if report.get("bytes", 0) >= report.get("budget_bytes", ARCHIVE_LIMIT) * 0.8
+             else "ok")
+    report["notification_level"] = level
+    if level == "ok" or previous.get("notification_level") == level or sys.platform != "darwin":
+        return
+    message = ("New workspace snapshots could not be saved. Run cmux-ws-manager archive status."
+               if level == "blocked" else
+               "Workspace snapshot storage is at least 80% full. Run cmux-ws-manager archive status.")
+    try:
+        subprocess.run(["/usr/bin/osascript", "-e",
+                        'display notification ' + json.dumps(message) +
+                        ' with title "cmux workspace snapshots"'],
+                       capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # persistent status and picker notices remain available
+    report["notification_at"] = datetime.now().timestamp()
+
+def collect_archive():
+    notices, report = [], {}
+    catalog = load_group_catalog()
+    session_groups(catalog)
+    closed_history(catalog, notices, report, notify=True)
+    save_group_catalog(catalog, save_aliases=False)
+    for notice in report["notices"]:
+        print(notice, file=sys.stderr)
+    print(f"Snapshot collection: {'complete' if report['complete'] else 'incomplete'}; "
+          f"{report.get('snapshots', 0)} saved checkpoint(s).")
+    return 0 if report["complete"] else 1
+
+def launchctl(args):
+    try:
+        result = subprocess.run(["launchctl"] + args, capture_output=True, text=True,
+                                errors="replace", timeout=10)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+def collector_definition():
+    return {"Label": COLLECTOR_LABEL,
+            "ProgramArguments": ["/usr/bin/python3", COLLECTOR_SCRIPT, "archive", "collect"],
+            "RunAtLoad": True, "WatchPaths": [NATIVE], "StartInterval": 60,
+            "ThrottleInterval": 10, "ProcessType": "Background",
+            "StandardOutPath": "/dev/null", "StandardErrorPath": "/dev/null"}
+
+def configure_collector(install):
+    if sys.platform != "darwin":
+        print("The background collector requires macOS launchd.", file=sys.stderr)
+        return 1
+    service = f"gui/{os.getuid()}/{COLLECTOR_LABEL}"
+    previous, previous_script = None, None
+    try:
+        try:
+            with open(COLLECTOR_PLIST, "rb") as f:
+                previous = f.read()
+            if as_dict(plistlib.loads(previous)).get("Label") != COLLECTOR_LABEL:
+                raise ValueError("Unrecognized collector plist")
+        except FileNotFoundError:
+            pass
+        try:
+            with open(COLLECTOR_SCRIPT, "rb") as f:
+                previous_script = f.read()
+        except FileNotFoundError:
+            pass
+        loaded = launchctl(["print", service])
+        if loaded and not launchctl(["bootout", service]):
+            raise OSError("Could not stop existing collector")
+        if not install:
+            if previous is not None:
+                os.unlink(COLLECTOR_PLIST)
+            if previous_script is not None:
+                os.unlink(COLLECTOR_SCRIPT)
+            print("Background collection disabled; saved snapshots are kept.")
+            return 0
+        try:
+            # launchd cannot reliably read scripts in privacy-protected folders
+            # such as Documents. Install a private copy independent of checkout.
+            with open(os.path.realpath(__file__), "rb") as f:
+                atomic_write(COLLECTOR_SCRIPT, f.read())
+            atomic_write(COLLECTOR_PLIST, plistlib.dumps(collector_definition()))
+            if not launchctl(["bootstrap", f"gui/{os.getuid()}", COLLECTOR_PLIST]):
+                raise OSError("Could not start collector")
+        except OSError:
+            if previous_script is not None:
+                atomic_write(COLLECTOR_SCRIPT, previous_script)
+            else:
+                try:
+                    os.unlink(COLLECTOR_SCRIPT)
+                except FileNotFoundError:
+                    pass
+            if previous is not None:
+                atomic_write(COLLECTOR_PLIST, previous)
+                if loaded:
+                    launchctl(["bootstrap", f"gui/{os.getuid()}", COLLECTOR_PLIST])
+            else:
+                try:
+                    os.unlink(COLLECTOR_PLIST)
+                except FileNotFoundError:
+                    pass
+            raise
+        print("Background collection enabled: history-file changes plus a 60-second check.")
+        return collect_archive()
+    except (OSError, ValueError, plistlib.InvalidFileException, ExpatError, RecursionError):
+        print("Could not configure the collector; check LaunchAgents permissions and launchctl.",
+              file=sys.stderr)
+        return 1
+
+def collector_state():
+    """A loaded job can still fail before Python reaches archive collection."""
+    if sys.platform != "darwin":
+        return False, None
+    try:
+        result = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{COLLECTOR_LABEL}"],
+                                capture_output=True, text=True, errors="replace", timeout=10)
+        match = re.search(r"^\s*last exit code = (-?\d+)\s*$", result.stdout, re.MULTILINE)
+        return result.returncode == 0, int(match[1]) if match else None
+    except (OSError, subprocess.TimeoutExpired):
+        return False, None
+
+def archive_status():
+    try:
+        budget = archive_budget()
+        items, meta = archive_inventory()
+        size = os.path.getsize(SNAPSHOTS) if os.path.exists(SNAPSHOTS) else 0
+    except (OSError, ValueError, RecursionError):
+        print("Could not read archive or budget settings.", file=sys.stderr)
+        return 1
+    print(f"Snapshot archive: {size / 1_000_000:.2f} / {budget / 1_000_000:g} MB "
+          f"({size / budget:.1%}); up to {ARCHIVE_VERSIONS} checkpoints per workspace.")
+    print(f"Saved: {len(items)} checkpoint(s) across {len({identity(it) for it in items.values()})} workspace(s).")
+    enabled, last_exit = collector_state()
+    print("Background collector: " + ("enabled" if enabled else "disabled; run 'archive install'."))
+    if enabled and last_exit is not None:
+        print(f"Last background exit code: {last_exit}" +
+              ("; run 'archive install' to repair or refresh the collector." if last_exit else " (success)."))
+    report = as_dict(read_json(ARCHIVE_STATUS))
+    if finite_number(report.get("collected_at")):
+        print("Last collection: " + when_of({"ts": report["collected_at"]}) +
+              ("; complete." if report.get("complete") else "; incomplete."))
+    else:
+        print("Last collection: unknown; run 'archive collect'.")
+    for note in as_list(report.get("notices")):
+        if as_text(note):
+            print(sanitize(note))
+    if size >= budget * 0.8:
+        print("Capacity warning: increase the budget or delete saved workspaces before storage fills.")
+    if meta["future"] or meta["invalid"]:
+        print("Some archive records have an unsupported or malformed format.")
+    return 1 if (meta["future"] or meta["invalid"] or report.get("complete") is False
+                 or (enabled and last_exit)) else 0
+
+def set_archive_budget(mb):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        fd = os.open(SNAPSHOTS + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            archive_budget()  # never overwrite malformed/unknown settings
+            items, meta = archive_inventory()
+            if meta["future"] or meta["invalid"]:
+                raise ValueError("Unreadable archive records")
+            groups, cutoffs = {}, deletion_cutoffs()
+            for item in items.values():
+                if not was_deleted(item, cutoffs):
+                    groups.setdefault(identity(item), []).append(item)
+            if fit_archive(groups, mb * 1_000_000) is None:
+                print("That budget cannot hold the protected recovery copies. "
+                      "Delete selected saved workspaces first or choose a larger budget.", file=sys.stderr)
+                return 1
+            atomic_write(ARCHIVE_SETTINGS, (json.dumps({"version": 1, "budget_mb": mb}) + "\n").encode())
+    except (OSError, ValueError, RecursionError):
+        print("Could not change the archive budget; existing settings preserved.", file=sys.stderr)
+        return 1
+    print(f"Archive budget set to {mb} MB.")
+    return collect_archive()
+
+def workspace_checkpoints(item):
+    cutoffs = deletion_cutoffs()
+    candidates = []
+    notices = []
+    available = {snapshot_key(entry): entry for entry in closed_history(notices=notices)}
+    # Native history wins the normal view. Recovery selection can still access
+    # a better archived revision of the same close.
+    try:
+        saved, _ = archive_inventory()
+        for key, entry in saved.items():
+            try:
+                if key not in available or checkpoint_info(entry)[1:3] > checkpoint_info(available[key])[1:3]:
+                    available[key] = entry
+            except (ValueError, RecursionError):
+                pass
+    except OSError:
+        pass
+    for entry in available.values():
+        if identity(entry) == identity(item) and not was_deleted(entry, cutoffs):
+            try:
+                checkpoint_info(entry)
+                candidates.append(entry)
+            except (ValueError, RecursionError):
+                pass
+    for notice in notices:
+        print(notice, file=sys.stderr)
+    selected, protected = select_checkpoints(candidates)
+    selected.sort(key=lambda it: (it["ts"], it["id"]), reverse=True)
+    for entry in selected:
+        entry["title"] = entry.get("custom") or item["title"]
+        entry["protected"] = snapshot_key(entry) in protected
+    return selected
+
+def archive_command(args):
+    if args == ["collect"]:
+        return collect_archive()
+    if args == ["status"]:
+        return archive_status()
+    if args in (["install"], ["uninstall"]):
+        return configure_collector(args == ["install"])
+    if (len(args) == 2 and args[0] == "budget" and re.fullmatch(r"[0-9]{1,6}", args[1])
+            and 1 <= int(args[1]) <= 100_000):
+        return set_archive_budget(int(args[1]))
+    if (len(args) == 2 and args[0] == "versions" and re.fullmatch(r"[0-9]{1,9}", args[1])
+            and int(args[1]) >= 1):
+        index, items = int(args[1]), entries()
+        if 1 <= index <= len(items):
+            checkpoints = workspace_checkpoints(items[index - 1])
+            if not checkpoints:
+                print("No saved checkpoints for this workspace.")
+                return 0
+            for i, item in enumerate(checkpoints, 1):
+                protected = "  (protected recovery copy)" if item["protected"] else ""
+                print(f"{i:>3}  {when_of(item)}  {badges(item)}{protected}")
+            print(f"Reopen with: {os.path.basename(sys.argv[0])} reopen {index} --snapshot <n>")
+            return 0
+    print("usage: cmux-ws-manager archive status|collect|install|uninstall|budget <MB>|versions <n>\n"
+          "Try 'cmux-ws-manager --help' for more information.", file=sys.stderr)
+    return 1
 
 def resume_command_for(term, bind_sessions=True):
     """Shell text that brings one pane's agent session back, or None.
@@ -1442,7 +1996,7 @@ def delete_entry(it):
         with open(DELETIONS + ".lock", "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             data = load_deletions(strict=True)
-            closes = native_closed() + [event_close(ev) for ev in load_events().values()
+            closes = closed_history() + [event_close(ev) for ev in load_events().values()
                                        if ev["name"] == "workspace.closed"]
             key = identity(it)
             ids = {entry["id"] for entry in closes if identity(entry) == key and entry["id"]}
@@ -1484,7 +2038,7 @@ def dir_occupied(it, open_cwds, open_titles):
     custom = (it.get("custom") or "").strip().casefold()
     return not custom or custom in open_titles.get(d, set())
 
-def entries(show_all=False):
+def entries(show_all=False, notices=None):
     titles, ev_closed, created_at = {}, {}, {}
     cutoffs = deletion_cutoffs()
     ordered = sorted(load_events().values(), key=lambda e: (
@@ -1501,12 +2055,23 @@ def entries(show_all=False):
             ev_closed.pop(wsid, None)  # reopened (e.g. session restore)
             created_at[wsid] = max(created_at.get(wsid, 0), ts)
     catalog = load_group_catalog()
-    native = [n for n in native_closed(catalog) if not was_deleted(n, cutoffs)]
+    archive_notices = []
+    native = [n for n in closed_history(catalog, archive_notices) if not was_deleted(n, cutoffs)]
+    if notices is not None:
+        notices.extend(archive_notices)
+    else:
+        for notice in archive_notices:
+            print(notice, file=sys.stderr)
     session_groups(catalog)
-    native_ids = {n["id"] for n in native}
     items = [n for n in native if created_at.get(n["id"], 0) <= n["ts"]]
+    latest_native = {}
+    for item in items:
+        latest_native[item["id"]] = max(latest_native.get(item["id"], -math.inf), item["ts"])
+    # An archived close must not swallow a later close of the same UUID when
+    # the intervening workspace.created event rotated out before we saw it.
     items += [e for e in ev_closed.values()
-              if e["id"] not in native_ids and not was_deleted(e, cutoffs)]
+              if e["ts"] > latest_native.get(e["id"], -math.inf) + CLOSE_EVENT_SLOP
+              and not was_deleted(e, cutoffs)]
     windows = cmux_windows()
     open_ids, open_cwds, open_titles = open_workspaces(as_list(windows))
     methods = as_list(as_dict(cmux_json(["capabilities"])).get("methods"))
@@ -1540,6 +2105,12 @@ def entries(show_all=False):
             # same directory
             it = graft_agents(it, donors.get(key, []))
             it["dir_open"] = norm_path(it["cwd"]) in open_cwds
+            try:
+                current = checkpoint_info(it)[1:3] if it.get("snapshot") else (False, False)
+                it["older_layout"] = any(checkpoint_info(n)[1:3] > current
+                                         for n in donors.get(key, []) if n["ts"] < it["ts"])
+            except (ValueError, RecursionError):
+                pass
         out.append(it)
     return out
 
@@ -1567,12 +2138,16 @@ def print_list(items, show_all, prog):
         branch = f"  [{sanitize(it['branch'])}]" if it["branch"] else ""
         taken = "  (dir open)" if it.get("dir_open") else ""
         group = f"  ({sanitize(group_label(it))})" if group_label(it) else ""
+        missing = "  (no usable snapshot)" if build_layout(it.get("snapshot")) is None else ""
+        older = "  (older layout saved)" if it.get("older_layout") else ""
         print(f"{i:>3}  {when_of(it):<13} {sanitize(it['title']):<28} "
-              f"{sanitize(short_cwd(it, home))}{branch}{taken}{group}")
+              f"{sanitize(short_cwd(it, home))}{branch}{taken}{group}{missing}{older}")
     if show_all:
         print("\n(--all view; reopen numbering follows the default filtered list)")
     else:
         print(f"\nReopen one with: {prog} reopen <n>")
+        if any(it.get("older_layout") for it in items):
+            print(f"Older layouts: {prog} archive versions <n>")
 
 def created_workspace(output):
     match = re.fullmatch(r"OK (workspace:[0-9]+|" + UUID_PATTERN + r")", as_text(output).strip())
@@ -1818,7 +2393,7 @@ def badges(it):
     snap = it.get("snapshot")
     if remote_snapshot(snap):
         parts = ["remote snapshot"]
-    elif not snap:
+    elif build_layout(snap) is None:
         parts = ["no snapshot"]
     else:
         t, a, b = restore_counts(snap)
@@ -1827,6 +2402,8 @@ def badges(it):
         parts = parts or ["empty"]
     if it.get("dir_open"):
         parts.append("dir open")
+    if it.get("older_layout"):
+        parts.append("older layout saved")
     return "  ".join(parts)
 
 def visible(st):
@@ -2032,8 +2609,9 @@ def tui_load(stdscr, st):
     st["items"], st["status"] = [], "Loading closed workspaces" + st["ell"]
     tui_draw(stdscr, st)
     try:
-        st["items"] = entries(st["show_all"])
-        st["status"] = ""
+        notices = []
+        st["items"] = entries(st["show_all"], notices)
+        st["status"] = " ".join(notices)
     except Exception as e:  # history is untrusted; never die on one bad file
         st["status"] = f"Could not read history ({e.__class__.__name__})."
     curses.flushinp()  # entries() blocks for seconds; drop keys typed meanwhile
@@ -2344,8 +2922,8 @@ def tui_main(stdscr, st):
     try:
         tui_load(stdscr, st)
         while True:
-            tui_draw(stdscr, st)
             try:
+                tui_draw(stdscr, st)
                 k = read_key(stdscr)
             except KeyboardInterrupt:
                 if not st.get("delete"):
@@ -2402,6 +2980,18 @@ def main():
     if "-h" in argv or "--help" in argv:
         print(HELP.format(prog=prog), end="")  # short-circuits before any
         return                                 # history read or cmux call
+    if argv and argv[0] == "archive":
+        return archive_command(argv[1:])
+    checkpoint = None
+    if "--snapshot" in argv:
+        pos = argv.index("--snapshot")
+        if (argv.count("--snapshot") != 1 or pos + 1 >= len(argv)
+                or not re.fullmatch(r"[0-9]{1,9}", argv[pos + 1])
+                or int(argv[pos + 1]) < 1 or "--plain" in argv):
+            sys.exit(f"{prog}: --snapshot requires a positive checkpoint number, without --plain.\n"
+                     f"Try '{prog} --help' for more information.")
+        checkpoint = int(argv[pos + 1])
+        argv = argv[:pos] + argv[pos + 2:]
     show_all = "--all" in argv
     plain = "--plain" in argv
     no_tui = "--no-interactive" in argv
@@ -2409,6 +2999,9 @@ def main():
     bad = [a for a in args if a.startswith("-")]
     if bad:
         sys.exit(f"{prog}: unrecognized option: {bad[0]}\n"
+                 f"Try '{prog} --help' for more information.")
+    if checkpoint is not None and (not args or args[0] != "reopen"):
+        sys.exit(f"{prog}: --snapshot requires reopen <n>.\n"
                  f"Try '{prog} --help' for more information.")
     if args and args[0] == "settings":
         if argv != ["settings", "diff"]:
@@ -2436,11 +3029,24 @@ def main():
             sys.exit(usage)
         return do_delete(dict(items[index - 1]))
     if args and args[0] == "reopen":
+        usage = (f"usage: {prog} reopen <n> [--plain | --snapshot <k>]\n"
+                 f"Try '{prog} --help' for more information.")
+        if len(args) != 2 or not re.fullmatch(r"[0-9]{1,9}", args[1]) or int(args[1]) < 1:
+            sys.exit(usage)
         items = entries()  # reopen indices always refer to the default filtered list
-        if len(args) < 2 or not args[1].isdigit() or not (1 <= int(args[1]) <= len(items)):
-            sys.exit(f"usage: {prog} reopen <n> [--plain]   (run with no args to see numbers)\n"
-                     f"Try '{prog} --help' for more information.")
-        sys.exit(do_reopen(items[int(args[1]) - 1], plain))
+        if int(args[1]) > len(items):
+            sys.exit(usage)
+        item = items[int(args[1]) - 1]
+        if checkpoint is not None:
+            checkpoints = workspace_checkpoints(item)
+            if checkpoint > len(checkpoints):
+                sys.exit(f"{prog}: checkpoint out of range; run archive versions {args[1]}.\n"
+                         f"Try '{prog} --help' for more information.")
+            item = checkpoints[checkpoint - 1]
+        return do_reopen(item, plain)
+    if args or plain:
+        sys.exit(f"usage: {prog} [--all] [--no-interactive]\n"
+                 f"Try '{prog} --help' for more information.")
     if not no_tui and tui_available():
         st = run_tui(show_all)
         if st is not None:  # curses ran, so the list was already loaded once
