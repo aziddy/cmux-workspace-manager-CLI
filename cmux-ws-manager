@@ -2346,7 +2346,7 @@ def put(win, y, x, s, n, attr=0):
     except curses.error:
         pass
 
-def tui_colors():
+def tui_colors(st):
     """Named attributes, degrading to bold/dim/reverse without color.
 
     The selection is reverse video in every mode: it inherits the user's
@@ -2355,6 +2355,7 @@ def tui_colors():
     names = ("hdr", "num", "time", "title", "path", "meta", "badge", "bar", "warn")
     a = dict.fromkeys(names, 0)
     a["sel"] = curses.A_REVERSE | curses.A_BOLD
+    st["workspace_colors"] = None
     if os.environ.get("NO_COLOR", "") or not curses.has_colors():
         a.update(hdr=curses.A_BOLD, num=curses.A_BOLD, title=curses.A_BOLD,
                  time=curses.A_DIM, meta=curses.A_DIM, badge=curses.A_DIM,
@@ -2386,7 +2387,50 @@ def tui_colors():
     a["warn"] = pair(6, curses.COLOR_RED, fallback=curses.A_BOLD) | curses.A_BOLD
     a["bar"] = pair(7, curses.COLOR_BLACK, curses.COLOR_CYAN,
                     fallback=curses.A_REVERSE)
+    palette = {}
+    if curses.COLORS >= 256:
+        # xterm's fixed cube/grays avoid the theme-dependent first 16 colors.
+        # macOS ncurses can report ANSI RGBs for extended color_content indexes.
+        levels = (0, 95, 135, 175, 215, 255)
+        for n in range(216):
+            palette[n + 16] = tuple(levels[i] * 1000 // 255
+                                    for i in (n // 36, n // 6 % 6, n % 6))
+        for n in range(24):
+            palette[n + 232] = ((8 + n * 10) * 1000 // 255,) * 3
+    else:
+        for n in range(min(curses.COLORS, 16)):
+            try:
+                palette[n] = curses.color_content(n)
+            except (curses.error, ValueError):
+                pass
+    if palette:
+        st["workspace_colors"] = {"palette": palette, "pairs": {}, "attrs": {}, "bg": bg,
+                                  "limit": min(curses.COLOR_PAIRS, 256)}
     return a
+
+def workspace_color_attr(it, st):
+    """Approximate a saved RGB color without changing the terminal's palette."""
+    colors = st.get("workspace_colors")
+    color = as_text(as_dict(it.get("snapshot")).get("customColor"))
+    if not colors or not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+        return 0
+    color = color.upper()
+    if color not in colors["attrs"]:
+        rgb = tuple(int(color[i:i + 2], 16) * 1000 // 255 for i in (1, 3, 5))
+        fg = min(colors["palette"], key=lambda n: sum(
+            (a - b) ** 2 for a, b in zip(rgb, colors["palette"][n])))
+        pairs = colors["pairs"]
+        if fg not in pairs:
+            n, attr = 8 + len(pairs), 0  # pairs 1–7 belong to the existing UI
+            if n < colors["limit"]:
+                try:
+                    curses.init_pair(n, fg, colors["bg"])
+                    attr = curses.color_pair(n)
+                except (curses.error, ValueError):
+                    pass
+            pairs[fg] = attr
+        colors["attrs"][color] = pairs[fg]
+    return colors["attrs"][color]
 
 def badges(it):
     """What a reopen would restore — counts only, never session identifiers."""
@@ -2449,12 +2493,19 @@ def draw_row(stdscr, st, y, num, it, selected, w):
         put(stdscr, y, 0,     # A_REVERSE is unreadable on many terminals
             pad(mark + label + when + pad(title, tw + 2) + cwd, w), w, a["sel"])
         put(stdscr, y + 1, 0, pad(" " * cwd_x + meta, w), w, a["sel"])
-        return
-    put(stdscr, y, 0, mark + label, MARK_W + NUM_W, a["num"])
-    put(stdscr, y, MARK_W + NUM_W, when, WHEN_W, a["time"])
-    put(stdscr, y, MARK_W + NUM_W + WHEN_W, title, tw, a["title"])
-    put(stdscr, y, cwd_x, cwd, rest, a["path"])
-    put(stdscr, y + 1, cwd_x, meta, rest, a["badge"])
+    else:
+        put(stdscr, y, 0, mark + label, MARK_W + NUM_W, a["num"])
+        put(stdscr, y, MARK_W + NUM_W, when, WHEN_W, a["time"])
+        put(stdscr, y, MARK_W + NUM_W + WHEN_W, title, tw, a["title"])
+        put(stdscr, y, cwd_x, cwd, rest, a["path"])
+        put(stdscr, y + 1, cwd_x, meta, rest, a["badge"])
+    color = workspace_color_attr(it, st)
+    color_x = MARK_W + NUM_W + WHEN_W - 2  # existing padding before the title
+    if color and color_x < w:
+        # Overlay without reverse/bold so selection never changes the saved hue.
+        bar = "|" if asc else "▏"
+        put(stdscr, y, color_x, bar, 1, color)
+        put(stdscr, y + 1, color_x, bar, 1, color)
 
 def hint_bar(st, w):
     frags = ([st["up"] + st["down"] + " move", st["enter"] + " reopen",
@@ -2918,7 +2969,7 @@ def tui_main(stdscr, st):
     except curses.error:
         pass
     stdscr.keypad(True)
-    st["attr"] = tui_colors()
+    st["attr"] = tui_colors(st)
     try:
         tui_load(stdscr, st)
         while True:
@@ -2951,7 +3002,7 @@ def run_tui(show_all):
     except locale.Error:
         pass
     try:  # the codeset ncurses will encode with; getpreferredencoding reports
-        "…▸↑↓⏎".encode(locale.nl_langinfo(locale.CODESET))  # UTF-8 regardless
+        "…▸▏↑↓⏎".encode(locale.nl_langinfo(locale.CODESET))  # UTF-8 regardless
         uni = True
     except (UnicodeEncodeError, LookupError, AttributeError, ValueError):
         uni = False

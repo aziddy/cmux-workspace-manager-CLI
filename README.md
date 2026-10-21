@@ -31,6 +31,13 @@ with `(no usable snapshot)`.
 use `archive versions <n>` to inspect it and `reopen <n> --snapshot <k>` to restore it.
 `group unknown` means cmux saved a group ID but its name is no longer available.
 
+A slim colored bar before the title shows the workspace color saved in its
+snapshot, across both lines of the entry and even while selected. The picker
+uses the closest available terminal color without changing your terminal's
+palette; ASCII terminals use `|` for the bar. Entries without a valid saved
+color have no bar. Color bars are hidden when `NO_COLOR` is set or terminal
+colors are unavailable, and do not appear in the non-interactive listing.
+
 `AI*` means the session was carried over from an earlier close of the same
 workspace — see [Sessions that outlive their snapshot](#sessions-that-outlive-their-snapshot).
 `dir open` means another workspace is already sitting on that directory, so

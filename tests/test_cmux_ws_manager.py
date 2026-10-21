@@ -192,14 +192,14 @@ class CompatibilityTests(unittest.TestCase):
                               capture_output=True, text=True, timeout=10)
 
     @contextlib.contextmanager
-    def terminal_cli(self, *args):
+    def terminal_cli(self, *args, no_color="1"):
         master, slave = pty.openpty()
         process = None
         try:
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 90, 0, 0))
             process = subprocess.Popen([sys.executable, str(CLI)] + list(args),
                                        stdin=slave, stdout=slave, stderr=slave,
-                                       env={**os.environ, "TERM": "xterm-256color", "NO_COLOR": "1"},
+                                       env={**os.environ, "TERM": "xterm-256color", "NO_COLOR": no_color},
                                        preexec_fn=controlling_terminal)
             os.close(slave)
             slave = None
@@ -284,6 +284,30 @@ class CompatibilityTests(unittest.TestCase):
                 "status": "", "pick": None, "show_all": False, "ell": "...", "ascii": False,
                 "mark": ">", "attr": {key: 0 for key in
                 ("hdr", "warn", "time", "meta", "title", "bar", "sel")}}
+
+    @contextlib.contextmanager
+    def workspace_color_state(self, palette=None, colors=256, pairs=32767, no_color=""):
+        palette = palette if palette is not None else {
+            16: (0, 0, 0), 46: (0, 1000, 0), 196: (1000, 0, 0),
+            201: (1000, 0, 1000), 231: (1000, 1000, 1000)}
+
+        def content(n):
+            if n not in palette:
+                raise self.manager.curses.error("unavailable color")
+            return palette[n]
+
+        with mock.patch.dict(os.environ, {"NO_COLOR": no_color}), \
+                mock.patch.multiple(self.manager.curses, create=True,
+                                    COLORS=colors, COLOR_PAIRS=pairs,
+                                    has_colors=mock.Mock(return_value=True),
+                                    start_color=mock.Mock(), use_default_colors=mock.Mock(),
+                                    color_content=mock.Mock(side_effect=content),
+                                    init_color=mock.Mock(), init_pair=mock.Mock(),
+                                    color_pair=mock.Mock(side_effect=lambda n: n << 8)):
+            st = self.settings_tui_state()
+            st.update(home=str(self.home), dot="·")
+            st["attr"] = self.manager.tui_colors(st)
+            yield st
 
     def test_settings_factory_values_and_explicit_defaults_are_omitted(self):
         self.settings({"app": {"appearance": "system", "focusPaneOnFirstClick": False,
@@ -879,6 +903,119 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(st["status"], "Deletion cancelled.")
         read.assert_called_once()  # the loop stayed open until the later q key
         self.assertFalse(Path(self.manager.DELETIONS).exists())
+
+    def test_workspace_color_palette_matching_and_pair_reuse(self):
+        with self.workspace_color_state() as st:
+            curses = self.manager.curses
+            curses.init_pair.reset_mock()
+            for color in ("#ff00ff", "#FF00FF", "#FD01FA"):
+                attr = self.manager.workspace_color_attr({"snapshot": {"customColor": color}}, st)
+                self.assertEqual(attr, curses.color_pair(8))
+            curses.init_pair.assert_called_once_with(8, 201, -1)
+            self.assertEqual(self.manager.workspace_color_attr(
+                {"snapshot": {"customColor": "#00FF00"}}, st), curses.color_pair(9))
+            self.assertEqual(curses.init_pair.call_args, mock.call(9, 46, -1))
+            curses.init_color.assert_not_called()
+        with self.workspace_color_state(palette={0: (0, 0, 0), 1: (1000, 0, 0)},
+                                        colors=8, pairs=64) as st:
+            self.assertTrue(self.manager.workspace_color_attr(
+                {"snapshot": {"customColor": "#F01234"}}, st))
+            self.manager.curses.init_pair.assert_called_with(8, 1, -1)
+
+    def test_workspace_color_unavailable_malformed_and_exhausted(self):
+        item = {"snapshot": {"customColor": "#FF00FF"}}
+        with self.workspace_color_state(no_color="1") as st:
+            self.assertEqual(self.manager.workspace_color_attr(item, st), 0)
+            self.manager.curses.start_color.assert_not_called()
+            self.manager.curses.init_pair.assert_not_called()
+        with self.workspace_color_state(palette={}, colors=8) as st:
+            self.assertEqual(self.manager.workspace_color_attr(item, st), 0)
+        with self.workspace_color_state() as st:
+            curses = self.manager.curses
+            curses.init_pair.reset_mock()
+            for snap in (None, [], "bad", {}, {"customColor": None}, {"customColor": []},
+                         {"customColor": 123}, {"customColor": "#ABC"},
+                         {"customColor": "#ABCDEG"}, {"customColor": "#12345678"},
+                         {"customColor": "#ABCDEF\n"}, {"customColor": "\x1b[31m"}):
+                self.assertEqual(self.manager.workspace_color_attr({"snapshot": snap}, st), 0)
+            curses.init_pair.assert_not_called()
+            curses.init_pair.side_effect = curses.error("pair unavailable")
+            self.assertEqual(self.manager.workspace_color_attr(item, st), 0)
+            self.assertEqual(self.manager.workspace_color_attr(item, st), 0)
+            curses.init_pair.assert_called_once()
+            curses.start_color.side_effect = curses.error("color unavailable")
+            self.manager.tui_colors(st)
+            self.assertEqual(self.manager.workspace_color_attr(item, st), 0)
+            curses.start_color.reset_mock()
+            curses.has_colors.return_value = False
+            self.manager.tui_colors(st)
+            curses.start_color.assert_not_called()
+        with self.workspace_color_state(pairs=9) as st:
+            self.assertTrue(self.manager.workspace_color_attr(item, st))
+            self.manager.curses.init_pair.reset_mock()
+            self.assertEqual(self.manager.workspace_color_attr(
+                {"snapshot": {"customColor": "#00FF00"}}, st), 0)
+            self.manager.curses.init_pair.assert_not_called()
+            self.assertTrue(self.manager.workspace_color_attr(item, st))
+
+    def test_workspace_color_bar_preserves_row_layout_and_selection(self):
+        item = {"title": "Project 界", "cwd": "/tmp/project", "branch": "feature/test",
+                "ts": 800000000, "snapshot": dict(snapshot(), customColor="#FF00FF")}
+        plain = dict(item, snapshot=snapshot())
+        with self.workspace_color_state() as st, mock.patch.object(self.manager, "put") as put:
+            for selected in (False, True):
+                for ascii_only in (False, True):
+                    for show_all in (False, True):
+                        for width in (30, 90):
+                            st.update(ascii=ascii_only, show_all=show_all)
+                            put.reset_mock()
+                            self.manager.draw_row(None, st, 2, 1, plain, selected, width)
+                            uncolored_calls = list(put.call_args_list)
+                            put.reset_mock()
+                            self.manager.draw_row(None, st, 2, 1, item, selected, width)
+                            self.assertEqual(put.call_args_list[:-2], uncolored_calls)
+                            bar = "|" if ascii_only else "▏"
+                            attr = self.manager.curses.color_pair(8)
+                            self.assertEqual(put.call_args_list[-2:], [
+                                mock.call(None, 2, 20, bar, 1, attr),
+                                mock.call(None, 3, 20, bar, 1, attr)])
+                            self.assertFalse(attr & self.manager.curses.A_REVERSE)
+                            self.assertFalse(attr & self.manager.curses.A_BOLD)
+
+    def test_workspace_color_uses_each_close_snapshot_after_agent_grafting(self):
+        self.native([closed(dict(snapshot("older", agent="claude"), customColor="#FF00FF")),
+                     closed(dict(snapshot("newer"), customColor="#00FF00"), 800000100)])
+        with self.workspace_color_state() as st:
+            items = self.manager.entries()
+            self.assertEqual(len(items), 1)
+            self.assertTrue(items[0]["grafted"])
+            self.assertTrue(self.manager.workspace_color_attr(items[0], st))
+            self.manager.curses.init_pair.assert_called_with(8, 46, -1)
+            items = self.manager.entries(True)
+            self.assertEqual(len(items), 2)
+            self.assertTrue(self.manager.workspace_color_attr(items[1], st))
+            self.manager.curses.init_pair.assert_called_with(9, 201, -1)
+        plain = self.run_cli("--no-interactive")
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertNotIn("▏", plain.stdout)
+        self.assertNotIn("\x1b", plain.stdout)
+
+    def test_real_curses_workspace_colors_navigation_search_and_refresh(self):
+        self.native([closed(dict(snapshot(title="Color fixture"), customColor="#FF00FF"), 800000100),
+                     closed(snapshot("plain", "/tmp/plain", "Plain fixture"))])
+        with self.terminal_cli(no_color="") as (process, master):
+            output = self.terminal_read(master, b"Plain fixture")
+            self.assertIn("▏".encode(), output)
+            self.assertIn(b"38;5;201m", output)
+            os.write(master, b"j/Plain\n")
+            self.terminal_read(master, b"filter: Plain")
+            self.assertIsNone(process.poll())
+            os.write(master, b"\x1br")
+            output = self.terminal_read(master, b"Color fixture")
+            self.assertIn("▏".encode(), output)
+            os.write(master, b"q")
+            self.assertEqual(self.terminal_wait(process, master), 0)
+        self.assertFalse(any(call[0] in ("new-workspace", "workspace-action") for call in self.calls()))
 
     def test_help_never_reads_history_or_invokes_cmux(self):
         self.native([closed(snapshot())])
